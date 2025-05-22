@@ -1,4 +1,5 @@
 from shiny import App, ui, render, reactive
+from pathlib import Path
 import platform
 import matplotlib
 import json
@@ -15,6 +16,10 @@ import warnings
 import os
 from htmltools import TagList, tags
 warnings.filterwarnings('ignore')
+
+BASE_DIR = Path(__file__).parent.resolve()
+DATA_DIR = BASE_DIR / "data"
+WWW_DIR  = BASE_DIR / "www"
 
 # ====== [1] 한글 폰트 설정 ======
 if platform.system() == 'Windows':
@@ -80,7 +85,7 @@ REGION_COLORS = {
 # ====== [5] 영천시 데이터 로딩 ======
 try:
     # 영천시 저수지 데이터
-    df_yeongcheon = pd.read_excel('./pettogether/경상북도_영천시_저수지및댐.xlsx').dropna()
+    df_yeongcheon = pd.read_excel(DATA_DIR / '경상북도_영천시_저수지및댐.xlsx').dropna()
     
     # 반려동물 동반 가능 시설 위치 리스트
     locations = [
@@ -145,7 +150,7 @@ try:
     )
 
     # 행정동 결합
-    gdf_yeongcheon = gpd.read_file("./pettogether/BND_ADM_DONG_PG.shp", encoding='cp949')
+    gdf_yeongcheon = gpd.read_file(DATA_DIR / "BND_ADM_DONG_PG.shp", encoding='cp949')
     gdf_yeongcheon = gdf_yeongcheon.to_crs(epsg=4326)
     yc_codes = [
         "37070330", "37070340", "37070350", "37070360", "37070370", "37070380",
@@ -247,7 +252,7 @@ def load_and_optimize_shapefile(shp_path: str):
     return gdf_final
 
 try:
-    gdf_gyeongbuk = load_and_optimize_shapefile("./pettogether/BND_SIGUNGU_PG.shp")
+    gdf_gyeongbuk = load_and_optimize_shapefile(DATA_DIR / "BND_SIGUNGU_PG.shp")
     unique_gyeongbuk_areas = sorted(gdf_gyeongbuk['행정구역'].unique())
 except Exception as e:
     print(f"경상북도 shapefile 로딩 오류: {e}")
@@ -1070,6 +1075,7 @@ def server(input, output, session):
                     const btn = document.getElementById('gyeongbuk-toggle-button');
                     const isClosed = sidebar.style.transform === 'translateX(-280px)';
                     sidebar.style.transform = isClosed ? 'translateX(0)' : 'translateX(-280px)';
+                    sidebar.classList.toggle('open', !isClosed);
                     btn.innerText = isClosed ? '〈' : '〉';
                     btn.style.left = isClosed ? '300px' : '20px';
                 """
@@ -1130,7 +1136,8 @@ def server(input, output, session):
                 
                 ui.input_action_button("gyeongbuk_apply_selection", "선택 지역 분석하기", 
                                     style="width: 92%; margin-top: 10px; padding: 10px; background-color: #4caf50; color: white; border: none; border-radius: 5px; font-weight: bold;"),
-                id="gyeongbuk-sidebar"
+                id="gyeongbuk-sidebar",
+                class_="open"
             ),
 
             # 팝업 창들
@@ -1244,12 +1251,12 @@ def server(input, output, session):
         
         try:
             fig = plot_radar_chart(
-                park_fp="./pettogether/시군별_공원_면적.xlsx",
-                acc_fp="./pettogether/경상북도 시도별 교통사고 건수.xlsx",
-                facility_fp="./pettogether/한국문화정보원_전국 반려동물 동반 가능 문화시설 위치 데이터_20221130.csv",
-                pop_fp="./pettogether/경상북도 주민등록.xlsx",
-                crime_fp="./pettogether/경찰청_범죄 발생 지역별 통계.xlsx",
-                pollution_fp="./pettogether/월별_도시별_대기오염도.xlsx",
+                park_fp=DATA_DIR / "시군별_공원_면적.xlsx",
+                acc_fp=DATA_DIR / "경상북도 시도별 교통사고 건수.xlsx",
+                facility_fp=DATA_DIR / "한국문화정보원_전국 반려동물 동반 가능 문화시설 위치 데이터_20221130.csv",
+                pop_fp=DATA_DIR / "경상북도 주민등록.xlsx",
+                crime_fp=DATA_DIR / "경찰청_범죄 발생 지역별 통계.xlsx",
+                pollution_fp=DATA_DIR / "월별_도시별_대기오염도.xlsx",
                 selected_regions=sel
             )
             
@@ -1355,7 +1362,7 @@ def server(input, output, session):
         # 각 탭별 차트 생성
         try:
             # 대기오염 차트
-            pollution_df = analyze_air_pollution_data("./pettogether/월별_도시별_대기오염도.xlsx")
+            pollution_df = analyze_air_pollution_data(DATA_DIR / "월별_도시별_대기오염도.xlsx")
             if pollution_df is not None and not pollution_df.empty:
                 pollutant_cols = [c for c in pollution_df.columns if c.endswith('_평균')]
                 norm = pollution_df.copy()
@@ -1393,7 +1400,7 @@ def server(input, output, session):
                 pollution_html = "<div>대기오염 데이터를 불러올 수 없습니다.</div>"
 
             # 범죄율 차트
-            crime_df = analyze_crime_rate("./pettogether/경찰청_범죄 발생 지역별 통계.xlsx", "./pettogether/경상북도 주민등록.xlsx")
+            crime_df = analyze_crime_rate(DATA_DIR / "경찰청_범죄 발생 지역별 통계.xlsx", DATA_DIR / "경상북도 주민등록.xlsx")
             crime_sel = crime_df[crime_df['region'].isin(sel)]
             crime_fig = px.bar(crime_sel, x='region', y='범죄율', color='region',
                               color_discrete_map=REGION_COLORS, labels={'범죄율':'1인당 범죄율','region':''})
@@ -1405,7 +1412,7 @@ def server(input, output, session):
             crime_html = crime_fig.to_html(full_html=False, include_plotlyjs='cdn', config={'displayModeBar': False})
 
             # 교통사고 차트  
-            traffic_df = analyze_accident_data("./pettogether/경상북도 시도별 교통사고 건수.xlsx")
+            traffic_df = analyze_accident_data(DATA_DIR / "경상북도 시도별 교통사고 건수.xlsx")
             traffic_sel = traffic_df[traffic_df['시군'].isin(sel)]
             traffic_fig = px.bar(traffic_sel, x='시군', y='사고비율', color='시군',
                                 color_discrete_map=REGION_COLORS, labels={'사고비율':'1인당 평균 사고','시군':''})
@@ -1417,7 +1424,7 @@ def server(input, output, session):
             traffic_html = traffic_fig.to_html(full_html=False, include_plotlyjs='cdn', config={'displayModeBar': False})
 
             # 공원면적 차트
-            park_df = analyze_park_area("./pettogether/시군별_공원_면적.xlsx")
+            park_df = analyze_park_area(DATA_DIR / "시군별_공원_면적.xlsx")
             park_sel = park_df[park_df['시군'].isin(sel)]
             park_fig = px.bar(park_sel, x='시군', y='공원면적비율', color='시군',
                              color_discrete_map=REGION_COLORS, labels={'공원면적비율':'1인당 공원면적','시군':''})
@@ -1429,7 +1436,7 @@ def server(input, output, session):
             park_html = park_fig.to_html(full_html=False, include_plotlyjs='cdn', config={'displayModeBar': False})
 
             # 반려동물 시설 차트
-            facility_df = analyze_population_facility_ratio("./pettogether/한국문화정보원_전국 반려동물 동반 가능 문화시설 위치 데이터_20221130.csv", "./pettogether/경상북도 주민등록.xlsx")
+            facility_df = analyze_population_facility_ratio(DATA_DIR / "한국문화정보원_전국 반려동물 동반 가능 문화시설 위치 데이터_20221130.csv", DATA_DIR / "경상북도 주민등록.xlsx")
             facility_sel = facility_df[facility_df['region'].isin(sel)]
             facility_fig = px.bar(facility_sel, x='region', y='per_person', color='region',
                                  color_discrete_map=REGION_COLORS, labels={'per_person':'1인당 시설 수','region':''})
@@ -1688,6 +1695,6 @@ def server(input, output, session):
 
 
 here = os.path.dirname(__file__)
-static_dir = os.path.join(here, "www")
+static_path = str(WWW_DIR)
 
-app = App(app_ui, server, static_assets=static_dir)
+app = App(app_ui, server, static_assets=static_path)
