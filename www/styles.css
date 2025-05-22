@@ -1,0 +1,123 @@
+:root {
+  --bslib-sidebar-main-bg: #f8f8f8;
+}
+
+body {
+  font-family: 'Pretendard', sans-serif;
+  color: #333;
+}
+/* ===== 헤더 스타일 ===== */
+#header {
+  background-color: #1e3a8a;  /* 짙은 남색 */
+  color: white;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 20px;
+  height: 60px;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  z-index: 9999;
+}
+
+/* 헤더 안 텍스트 */
+#header h3 {
+  margin: 0;
+  font-size: 18px;
+  color: white;
+  display: flex;
+  align-items: center;
+}
+
+/* 헤더 로고 이미지 */
+#header img {
+  height: 30px;
+  margin-right: 15px;
+}
+
+
+.tab-container {
+  display: flex;
+  gap: 4px;
+  background-color: #1e3a8a;
+  padding: 4px 10px;
+  border-radius: 8px 8px 0 0;
+}
+
+.tab-button {
+  padding: 6px 16px;
+  background-color: #1e3a8a; /* 비활성 배경 */
+  color: white;             /* 비활성 글씨 */
+  border: none;
+  border-radius: 8px 8px 0 0;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
+
+.tab-button.active {
+  background-color: white;  /* 선택된 탭 배경 */
+  color: #1e3a8a;            /* 선택된 탭 글씨 */
+}
+
+
+
+
+
+/* 좌측 슬라이딩 사이드바 */
+#sidebar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 340px;
+  height: 100vh;
+  background-color: white;
+  box-shadow: 2px 0 8px rgba(0,0,0,0.2);
+  transform: translateX(-100%);
+  transition: transform 0.3s ease-in-out;
+  z-index: 1000;
+  padding: 20px;
+}
+
+/* 열렸을 때 */
+#sidebar.open {
+  transform: translateX(0);
+}
+
+/* 토글 버튼 (열기/닫기 전환용) */
+#toggle-button {
+  position: absolute;
+  top: 20px;
+  right: -30px;
+  width: 30px;
+  height: 40px;
+  background-color: white;
+  border-radius: 0 8px 8px 0;
+  box-shadow: 2px 0 6px rgba(0,0,0,0.2);
+  border: 1px solid #ccc;
+  cursor: pointer;
+  font-size: 18px;
+  font-weight: bold;
+}
+
+.sidebar-section {
+  background-color: white;
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+}
+
+.card {
+  background-color: white;
+  border-radius: 8px;
+  padding: 16px;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+}
+
+button:hover {
+  background-color: #f3f4f6;
+}
