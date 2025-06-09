@@ -1,10 +1,21 @@
-shiny
+# Shiny for Python
+shiny>=0.10.0
 htmltools
-pandas
-numpy
-matplotlib
-folium
-geopandas
-shapely
-plotly
+
+# 데이터 처리
+pandas>=2.0.0
+numpy>=1.24.0
 openpyxl
+
+# 지리 데이터
+geopandas>=0.14.0
+shapely>=2.0.0
+Fiona>=1.9.0
+
+# 시각화
+plotly>=5.17.0
+matplotlib>=3.7.0
+folium>=0.14.0
+
+# 메모리 모니터링
+psutil

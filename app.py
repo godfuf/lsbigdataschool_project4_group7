@@ -14,6 +14,8 @@ import geopandas as gpd
 from shapely.geometry import Point
 import warnings
 import os
+import gc  # 가비지 컬렉터 추가
+import psutil  # 메모리 모니터링
 from htmltools import TagList, tags
 warnings.filterwarnings('ignore')
 
@@ -30,30 +32,92 @@ else:
     matplotlib.rc('font', family='NanumGothic')
 matplotlib.rcParams['axes.unicode_minus'] = False
 
-# ====== [2] 경상북도용 유틸리티 함수 ======
+# ====== [2] 메모리 최적화 함수들 ======
+def optimize_dataframe_memory(df):
+    """DataFrame의 메모리 사용량을 최적화하는 함수"""
+    if df.empty:
+        return df
+    
+    for col in df.columns:
+        col_type = df[col].dtype
+        
+        # 숫자형 컬럼만 최적화 (category 변환은 제외)
+        if col_type != 'object' and 'category' not in str(col_type):
+            try:
+                c_min = df[col].min()
+                c_max = df[col].max()
+                
+                if str(col_type)[:3] == 'int':
+                    if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
+                        df[col] = df[col].astype(np.int8)
+                    elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                        df[col] = df[col].astype(np.int16)
+                    elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+                        df[col] = df[col].astype(np.int32)
+                    elif c_min > np.iinfo(np.int64).min and c_max < np.iinfo(np.int64).max:
+                        df[col] = df[col].astype(np.int64)
+                
+                elif str(col_type)[:5] == 'float':
+                    if c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
+                        df[col] = df[col].astype(np.float32)
+                    else:
+                        df[col] = df[col].astype(np.float64)
+            except Exception:
+                # 오류 발생 시 원본 유지
+                continue
+    
+    return df
+
+def get_memory_usage():
+    """현재 메모리 사용량 반환"""
+    try:
+        process = psutil.Process(os.getpid())
+        memory_info = process.memory_info()
+        return {
+            'rss': memory_info.rss / 1024 / 1024,  # MB
+            'vms': memory_info.vms / 1024 / 1024   # MB
+        }
+    except:
+        return {'rss': 0, 'vms': 0}
+
+def log_memory_usage(stage):
+    """메모리 사용량 로깅"""
+    usage = get_memory_usage()
+    print(f"[{stage}] 메모리 사용량 - RSS: {usage['rss']:.1f}MB")
+
+# ====== [3] 경상북도용 유틸리티 함수 ======
 def unify_and_filter_region(df: pd.DataFrame, col: str, second_col: str = None) -> pd.DataFrame:
     """지역명을 통일하고 필터링하는 함수"""
-    df = df.copy()
+    try:
+        df = df.copy()
 
-    # 시군구 단위 기준 정리
-    region_keywords = [
-        "포항시", "경주시", "김천시", "안동시", "구미시", "영주시", "영천시", "상주시", "문경시", "경산시",
-        "의성군", "청송군", "영양군", "영덕군", "청도군", "고령군", "성주군", "칠곡군", "예천군", "봉화군",
-        "울진군", "울릉군"
-    ]
+        # 시군구 단위 기준 정리
+        region_keywords = [
+            "포항시", "경주시", "김천시", "안동시", "구미시", "영주시", "영천시", "상주시", "문경시", "경산시",
+            "의성군", "청송군", "영양군", "영덕군", "청도군", "고령군", "성주군", "칠곡군", "예천군", "봉화군",
+            "울진군", "울릉군"
+        ]
 
-    pattern = "(" + "|".join(region_keywords) + ")"
+        pattern = "(" + "|".join(region_keywords) + ")"
 
-    if second_col and second_col in df.columns:
-        df['region_raw'] = df[col].astype(str).str.strip() + " " + df[second_col].astype(str).str.strip()
-        df['region'] = df['region_raw'].str.extract(pattern)[0]
-    else:
-        df['region'] = df[col].astype(str).str.strip().str.extract(pattern)[0]
+        if second_col and second_col in df.columns:
+            df['region_raw'] = df[col].astype(str).str.strip() + " " + df[second_col].astype(str).str.strip()
+            df['region'] = df['region_raw'].str.extract(pattern)[0]
+        else:
+            df['region'] = df[col].astype(str).str.strip().str.extract(pattern)[0]
 
-    # 군위군 제거
-    return df[df['region'] != '군위군']
+        # 군위군 제거
+        result = df[df['region'] != '군위군'].copy()
+        return optimize_dataframe_memory(result)
+    
+    except Exception as e:
+        print(f"지역 필터링 오류: {e}")
+        # 오류 발생 시 원본 DataFrame에 기본 region 컬럼 추가
+        df_copy = df.copy()
+        df_copy['region'] = '기타'
+        return df_copy
 
-# ====== [3] 영천시용 거리 계산 함수 ======
+# ====== [4] 영천시용 거리 계산 함수 ======
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371
     lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
@@ -63,14 +127,30 @@ def haversine(lat1, lon1, lat2, lon2):
     c = 2 * np.arcsin(np.sqrt(a))
     return R * c
 
-# ====== [4] 경상북도 고정 데이터 ======
+@np.vectorize
+def haversine_vectorized(lat1, lon1, lat2, lon2):
+    """벡터화된 거리 계산 함수"""
+    R = 6371
+    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat / 2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2)**2
+    c = 2 * np.arcsin(np.sqrt(a))
+    return R * c
+
+# ====== [5] 경상북도 고정 데이터 ======
 REGIONS = ["포항시","경주시","김천시","안동시","구미시","영주시","영천시","상주시","문경시","경산시",
            "의성군","청송군","영양군","영덕군","청도군","고령군","성주군","칠곡군","예천군","봉화군",
            "울진군","울릉군"]
-POPULATION = [498296,257668,138999,154788,410306,99894,101185,93081,67674,285618,
-              49336,23867,15494,34338,41641,32350,43543,111928,54868,28988,
-              47872,9199]
-pop_df = pd.DataFrame({'시군': REGIONS, '인구수': POPULATION})
+
+POPULATION = np.array([498296,257668,138999,154788,410306,99894,101185,93081,67674,285618,
+                      49336,23867,15494,34338,41641,32350,43543,111928,54868,28988,
+                      47872,9199], dtype=np.int32)
+
+pop_df = pd.DataFrame({
+    '시군': REGIONS,  # 일반 리스트로 유지
+    '인구수': POPULATION
+})
 
 # 22개 지역별 고유 색상 배정
 REGION_COLORS = {
@@ -82,62 +162,116 @@ REGION_COLORS = {
     "울진군": "#4682B4", "울릉군": "#f7f2bd"
 }
 
-# ====== [5] 영천시 데이터 로딩 ======
+# ====== [6] 영천시 데이터 로딩 (수정된 버전) ======
 try:
     # 영천시 저수지 데이터
     df_yeongcheon = pd.read_excel(DATA_DIR / '경상북도_영천시_저수지및댐.xlsx').dropna()
     
-    # 반려동물 동반 가능 시설 위치 리스트
-    locations = [
-        (36.01841762, 128.929917), (35.97173253, 128.939907), (35.95973738, 128.93954),
-        (35.96594607, 128.918217), (35.93153836, 128.87455), (35.91826818, 129.011153),
-        (35.96426248, 128.924962), (35.93361167, 128.876258), (35.9719872, 128.941242),
-        (35.96837891, 128.933538), (35.97188757, 128.939926), (35.99097629, 128.823406),
-        (35.96468716, 128.938253), (35.96440713, 128.926174), (35.96371503, 128.939265),
-        (35.93358914, 128.871295), (35.9721287, 128.93577), (35.93067846, 128.870576),
-        (36.04169724, 128.787972), (35.96482654, 128.93923), (35.96359599, 128.936706),
-        (35.97502046, 128.947498), (35.95795857, 128.913141), (35.98890075, 128.95512),
-        (35.9581778, 128.913096), (35.96122769, 128.92841), (35.97523599, 128.94772),
-        (36.04494524, 128.799646), (35.97216113, 128.937574), (36.03276243, 128.889247),
-        (35.94410222, 128.897127), (36.01859865, 128.929978), (35.99026252, 128.794311),
-        (36.12326392, 128.901235), (35.97438618, 128.945949), (35.98250081, 128.95221),
-        (35.9722037, 128.935942), (35.95180542, 128.930731), (35.90275615, 128.856568),
-        (35.9584334, 128.909988), (36.05347739, 128.89304), (35.97592922, 128.953099),
-        (35.90275615, 128.856568),
-    ]
+    # 기본적인 데이터 타입 확인 및 변환
+    required_cols = ['시설명', '소재지지번주소', '위도', '경도', '면적', '둘레']
+    for col in required_cols:
+        if col not in df_yeongcheon.columns:
+            print(f"필수 컬럼 {col}이 없습니다.")
+            raise Exception(f"필수 컬럼 {col}이 없습니다.")
     
-    # 반경 2km 시설 수 계산
-    def count_nearby_facilities(lat, lon, locations, radius_km=2):
-        count = 0
-        for loc_lat, loc_lon in locations:
-            if haversine(lat, lon, loc_lat, loc_lon) <= radius_km:
-                count += 1
-        return count
+    # 숫자형 컬럼 변환
+    for col in ['위도', '경도', '면적', '둘레']:
+        df_yeongcheon[col] = pd.to_numeric(df_yeongcheon[col], errors='coerce')
+    
+    # 결측값 제거
+    df_yeongcheon = df_yeongcheon.dropna(subset=['위도', '경도', '면적', '둘레'])
+    
+    if len(df_yeongcheon) == 0:
+        raise Exception("유효한 데이터가 없습니다.")
+    
+    df_yeongcheon = optimize_dataframe_memory(df_yeongcheon)
+    print(f"영천시 저수지 데이터 로딩 완료: {len(df_yeongcheon)}개")
+    
+    # 반려동물 동반 가능 시설 위치 리스트 (numpy array로 최적화)
+    locations = np.array([
+        [36.01841762, 128.929917], [35.97173253, 128.939907], [35.95973738, 128.93954],
+        [35.96594607, 128.918217], [35.93153836, 128.87455], [35.91826818, 129.011153],
+        [35.96426248, 128.924962], [35.93361167, 128.876258], [35.9719872, 128.941242],
+        [35.96837891, 128.933538], [35.97188757, 128.939926], [35.99097629, 128.823406],
+        [35.96468716, 128.938253], [35.96440713, 128.926174], [35.96371503, 128.939265],
+        [35.93358914, 128.871295], [35.9721287, 128.93577], [35.93067846, 128.870576],
+        [36.04169724, 128.787972], [35.96482654, 128.93923], [35.96359599, 128.936706],
+        [35.97502046, 128.947498], [35.95795857, 128.913141], [35.98890075, 128.95512],
+        [35.9581778, 128.913096], [35.96122769, 128.92841], [35.97523599, 128.94772],
+        [36.04494524, 128.799646], [35.97216113, 128.937574], [36.03276243, 128.889247],
+        [35.94410222, 128.897127], [36.01859865, 128.929978], [35.99026252, 128.794311],
+        [36.12326392, 128.901235], [35.97438618, 128.945949], [35.98250081, 128.95221],
+        [35.9722037, 128.935942], [35.95180542, 128.930731], [35.90275615, 128.856568],
+        [35.9584334, 128.909988], [36.05347739, 128.89304], [35.97592922, 128.953099],
+        [35.90275615, 128.856568],
+    ], dtype=np.float32)
+    
+    # 반경 2km 시설 수 계산 (벡터화)
+    def count_nearby_facilities_vectorized(df_lats, df_lons, locations, radius_km=2):
+        facility_counts = np.zeros(len(df_lats), dtype=np.int8)
+        
+        try:
+            for i, (lat, lon) in enumerate(zip(df_lats, df_lons)):
+                if pd.isna(lat) or pd.isna(lon):
+                    facility_counts[i] = 0
+                    continue
+                distances = haversine_vectorized(lat, lon, locations[:, 0], locations[:, 1])
+                facility_counts[i] = np.sum(distances <= radius_km)
+        except Exception as e:
+            print(f"시설 수 계산 오류: {e}")
+            facility_counts = np.zeros(len(df_lats), dtype=np.int8)
+        
+        return facility_counts
 
-    df_yeongcheon['반경2km_시설수'] = df_yeongcheon.apply(
-        lambda row: count_nearby_facilities(row['위도'], row['경도'], locations), axis=1
+    df_yeongcheon['반경2km_시설수'] = count_nearby_facilities_vectorized(
+        df_yeongcheon['위도'].values, 
+        df_yeongcheon['경도'].values, 
+        locations
     )
 
     # 정규화 함수
     def normalize(series): 
-        return (series - series.min()) / (series.max() - series.min())
+        try:
+            # 숫자형 데이터가 아닌 경우 처리
+            if not pd.api.types.is_numeric_dtype(series):
+                return pd.Series(np.zeros(len(series)), index=series.index, dtype=np.float32)
+            
+            min_val, max_val = series.min(), series.max()
+            if max_val == min_val or pd.isna(min_val) or pd.isna(max_val):
+                return pd.Series(np.zeros(len(series)), index=series.index, dtype=np.float32)
+            return ((series - min_val) / (max_val - min_val)).astype(np.float32)
+        except Exception:
+            # 오류 발생 시 0으로 채운 시리즈 반환
+            return pd.Series(np.zeros(len(series)), index=series.index, dtype=np.float32)
 
     df_yeongcheon['면적_정규화'] = normalize(df_yeongcheon['면적'])
     df_yeongcheon['둘레_정규화'] = normalize(df_yeongcheon['둘레'])
     df_yeongcheon['시설수_정규화'] = normalize(df_yeongcheon['반경2km_시설수'])
 
     # 중심지와의 거리 계산
-    centers = [
-        (35.92646737, 128.8823282), (36.01411727, 129.02104376),
-        (35.96487293, 128.94139421), (36.05822495, 128.89287688),
-        (36.03249647, 128.79147335)
-    ]
+    centers = np.array([
+        [35.92646737, 128.8823282], [36.01411727, 129.02104376],
+        [35.96487293, 128.94139421], [36.05822495, 128.89287688],
+        [36.03249647, 128.79147335]
+    ], dtype=np.float32)
     
-    def get_closest_center_distance(lat, lon):
-        return min(haversine(lat, lon, c_lat, c_lon) for c_lat, c_lon in centers)
+    def get_closest_center_distance_vectorized(lats, lons, centers):
+        min_distances = np.full(len(lats), np.inf, dtype=np.float32)
+        
+        try:
+            for center_lat, center_lon in centers:
+                distances = haversine_vectorized(lats, lons, center_lat, center_lon)
+                min_distances = np.minimum(min_distances, distances)
+        except Exception as e:
+            print(f"거리 계산 오류: {e}")
+            min_distances = np.ones(len(lats), dtype=np.float32)
+        
+        return min_distances
 
-    df_yeongcheon['중심거리_km'] = df_yeongcheon.apply(
-        lambda row: get_closest_center_distance(row['위도'], row['경도']), axis=1
+    df_yeongcheon['중심거리_km'] = get_closest_center_distance_vectorized(
+        df_yeongcheon['위도'].values, 
+        df_yeongcheon['경도'].values, 
+        centers
     )
     df_yeongcheon['거리_정규화'] = 1 - normalize(df_yeongcheon['중심거리_km'])
 
@@ -147,119 +281,401 @@ try:
         0.3 * df_yeongcheon['둘레_정규화'] +
         0.2 * df_yeongcheon['거리_정규화'] +
         0.2 * df_yeongcheon['시설수_정규화']
-    )
+    ).astype(np.float32)
 
-    # 행정동 결합
-    gdf_yeongcheon = gpd.read_file(DATA_DIR / "BND_ADM_DONG_PG.shp", encoding='cp949')
-    gdf_yeongcheon = gdf_yeongcheon.to_crs(epsg=4326)
-    yc_codes = [
-        "37070330", "37070340", "37070350", "37070360", "37070370", "37070380",
-        "37070520", "37070540", "37070550", "37070510", "37070310", "37070320",
-        "37070110", "37070390", "37070400", "37070530"
-    ]
-    gdf_yeongcheon = gdf_yeongcheon[gdf_yeongcheon["ADM_CD"].astype(str).isin(yc_codes)]
+    # ====== 영천시 새로운 shapefile 사용 ======
+    try:
+        # 새로운 영천시 읍면동 shapefile 로딩
+        gdf_yeongcheon = gpd.read_file(DATA_DIR / "DA_EMD_202307.shp", encoding='cp949')
+        gdf_yeongcheon = gdf_yeongcheon.to_crs(epsg=4326)
+        
+        # 실제 컬럼명 확인 및 출력
+        print(f"영천시 Shapefile 컬럼명: {list(gdf_yeongcheon.columns)}")
+        print(f"영천시 데이터 샘플:")
+        if len(gdf_yeongcheon) > 0:
+            print(gdf_yeongcheon.head(3))
+        
+        # 가능한 컬럼명 패턴들을 시도
+        code_col = None
+        name_col = None
+        
+        # 코드 컬럼 찾기
+        for col in gdf_yeongcheon.columns:
+            col_upper = col.upper()
+            if any(pattern in col_upper for pattern in ['CD', 'CODE', '코드']):
+                code_col = col
+                break
+        
+        # 이름 컬럼 찾기  
+        for col in gdf_yeongcheon.columns:
+            col_upper = col.upper()
+            if any(pattern in col_upper for pattern in ['NM', 'NAME', '명', '이름']):
+                name_col = col
+                break
+        
+        # 컬럼을 찾지 못한 경우 기본값 시도
+        if code_col is None:
+            possible_code_cols = ['ADM_DR_CD', 'EMD_CD', 'DONG_CD', 'CD']
+            for col in possible_code_cols:
+                if col in gdf_yeongcheon.columns:
+                    code_col = col
+                    break
+        
+        if name_col is None:
+            possible_name_cols = ['ADM_DR_NM', 'EMD_NM', 'DONG_NM', 'NM']
+            for col in possible_name_cols:
+                if col in gdf_yeongcheon.columns:
+                    name_col = col
+                    break
+        
+        print(f"영천시 사용할 코드 컬럼: {code_col}")
+        print(f"영천시 사용할 이름 컬럼: {name_col}")
+        
+        # 컬럼을 찾은 경우에만 진행
+        if code_col and name_col:
+            # 필요한 컬럼만 유지
+            gdf_yeongcheon = gdf_yeongcheon[['geometry', code_col, name_col]].copy()
+            
+            # 영천시 행정동 코드 리스트 (기존과 동일)
+            yc_codes = [
+                "37070330", "37070340", "37070350", "37070360", "37070370", "37070380",
+                "37070520", "37070540", "37070550", "37070510", "37070310", "37070320",
+                "37070110", "37070390", "37070400", "37070530"
+            ]
+            
+            # 영천시 해당 행정동만 필터링
+            print(f"영천시 필터링 전 데이터 수: {len(gdf_yeongcheon)}")
+            gdf_yeongcheon = gdf_yeongcheon[gdf_yeongcheon[code_col].astype(str).isin(yc_codes)]
+            print(f"영천시 필터링 후 데이터 수: {len(gdf_yeongcheon)}")
+            
+            if len(gdf_yeongcheon) == 0:
+                print("경고: 영천시 해당 행정동 데이터가 없습니다.")
+                print(f"찾고 있는 코드: {yc_codes}")
+                sample_codes = gdf_yeongcheon[code_col].astype(str).unique()[:10]  # 처음 10개만
+                print(f"파일에 있는 코드 샘플: {sample_codes}")
+                raise Exception("영천시 데이터 없음")
+            
+            # 컬럼명 표준화
+            gdf_yeongcheon = gdf_yeongcheon.rename(columns={code_col: 'ADM_CD', name_col: 'ADM_NM'})
 
-    df_yeongcheon['geometry'] = [Point(xy) for xy in zip(df_yeongcheon['경도'], df_yeongcheon['위도'])]
-    df_yeongcheon_gdf = gpd.GeoDataFrame(df_yeongcheon, geometry='geometry', crs='EPSG:4326')
-    df_yeongcheon = df_yeongcheon.join(
-        gpd.sjoin(df_yeongcheon_gdf, gdf_yeongcheon[['geometry', 'ADM_CD', 'ADM_NM']], 
-                 how='left', predicate='within')[['ADM_NM']], how='left'
-    )
-    df_yeongcheon.rename(columns={'ADM_NM': '행정동명'}, inplace=True)
-    
-    unique_areas = ["전체"] + sorted(df_yeongcheon['행정동명'].dropna().unique().tolist())
+            # 지오메트리 단순화 (성능 향상)
+            gdf_yeongcheon['geometry'] = gdf_yeongcheon['geometry'].simplify(0.001)
+
+            # 저수지 포인트 데이터 생성
+            df_yeongcheon['geometry'] = [Point(xy) for xy in zip(df_yeongcheon['경도'], df_yeongcheon['위도'])]
+            df_yeongcheon_gdf = gpd.GeoDataFrame(df_yeongcheon, geometry='geometry', crs='EPSG:4326')
+            
+            # Spatial join으로 행정동 정보 결합
+            joined = gpd.sjoin(df_yeongcheon_gdf, gdf_yeongcheon[['geometry', 'ADM_CD', 'ADM_NM']], 
+                             how='left', predicate='within')
+            
+            # 행정동명 컬럼 추가
+            df_yeongcheon['행정동명'] = joined['ADM_NM'].values
+            
+            # 메모리 정리
+            del df_yeongcheon_gdf, joined
+            gc.collect()
+            
+            # 고유 지역 리스트 생성
+            unique_areas = ["전체"] + sorted(df_yeongcheon['행정동명'].dropna().unique().tolist())
+            print(f"영천시 행정동 데이터 결합 완료: {len(unique_areas)-1}개 행정동")
+            print(f"영천시 포함된 행정동: {unique_areas[1:]}")
+            
+        else:
+            print("영천시 적절한 컬럼을 찾을 수 없습니다.")
+            print(f"영천시 전체 컬럼 목록: {list(gdf_yeongcheon.columns)}")
+            print("영천시 기본값으로 진행합니다.")
+            raise Exception("영천시 컬럼 매핑 실패")
+        
+    except Exception as e:
+        print(f"영천시 Shapefile 로딩 오류: {e}")
+        print("영천시 기존 방식으로 대체합니다.")
+        gdf_yeongcheon = gpd.GeoDataFrame()
+        df_yeongcheon['행정동명'] = '알 수 없음'
+        unique_areas = ["전체", "알 수 없음"]
+        
+    # 최종 최적화
+    df_yeongcheon = optimize_dataframe_memory(df_yeongcheon)
+    print(f"영천시 데이터 로딩 완료: {len(df_yeongcheon)}개 저수지")
     
 except Exception as e:
     print(f"영천시 데이터 로딩 오류: {e}")
     df_yeongcheon = pd.DataFrame()
+    gdf_yeongcheon = gpd.GeoDataFrame()
     unique_areas = ["전체"]
 
-# ====== [6] 경상북도 Shapefile 로딩 ======
+# ====== [7] 경상북도 Shapefile 로딩 (수정된 버전) ======
 def load_and_optimize_shapefile(shp_path: str):
-    """Shapefile을 로드하고 성능을 위해 최적화"""
-    encodings = ['cp949', 'euc-kr', 'utf-8', 'latin1']
-    gdf = None
-    
-    for encoding in encodings:
-        try:
-            gdf = gpd.read_file(shp_path, encoding=encoding)
-            break
-        except Exception as e:
-            continue
-    
-    if gdf is None:
-        raise Exception("모든 인코딩 시도 실패")
-    
-    # CRS 확인 및 설정
-    if gdf.crs is None:
-        gdf.set_crs('EPSG:4326', inplace=True)
-    elif gdf.crs != 'EPSG:4326':
-        gdf = gdf.to_crs('EPSG:4326')
-    
-    # 지오메트리 단순화
-    gdf['geometry'] = gdf['geometry'].simplify(tolerance=0.001, preserve_topology=True)
-    
-    # 지역명 컬럼 찾기
-    potential_name_cols = [
-        'SIGUNGU_NM', 'SGG_NM', 'SIGUNGU', 'SGG', 'NAME', 'name',
-        'adm_nm', 'ADM_NM', 'full_nm', 'FULL_NM', 'sig_nm', 'SIG_NM'
-    ]
-    
-    name_col = None
-    for col in potential_name_cols:
-        if col in gdf.columns:
-            name_col = col
-            break
-    
-    if name_col is None:
+    """새로운 경상북도 시군구 전용 Shapefile을 로드하고 최적화"""
+    try:
+        # 새로운 경상북도 시군구 shapefile 로딩
+        gdf = gpd.read_file(shp_path, encoding='cp949')
+        
+        if gdf.crs is None:
+            gdf.set_crs('EPSG:4326', inplace=True)
+        elif gdf.crs != 'EPSG:4326':
+            gdf = gdf.to_crs('EPSG:4326')
+
+        # 실제 컬럼명 확인 및 출력
+        print(f"경상북도 Shapefile 컬럼명: {list(gdf.columns)}")
+        print(f"경상북도 데이터 샘플:")
+        if len(gdf) > 0:
+            print(gdf.head(3))
+        
+        # 가능한 컬럼명 패턴들을 시도
+        code_col = None
+        name_col = None
+        
+        # 코드 컬럼 찾기
         for col in gdf.columns:
-            if gdf[col].dtype == 'object' and col != 'geometry':
-                sample_values = gdf[col].dropna().head(3).tolist()
-                if any(any(keyword in str(val) for keyword in ['시', '군', '구']) for val in sample_values):
+            col_upper = col.upper()
+            if any(pattern in col_upper for pattern in ['CD', 'CODE', '코드']):
+                code_col = col
+                break
+        
+        # 이름 컬럼 찾기  
+        for col in gdf.columns:
+            col_upper = col.upper()
+            if any(pattern in col_upper for pattern in ['NM', 'NAME', '명', '이름']):
+                name_col = col
+                break
+        
+        # 컬럼을 찾지 못한 경우 기본값 시도
+        if code_col is None:
+            possible_code_cols = ['ADM_CD', 'SIG_CD', 'SIGUN_CD', 'CD']
+            for col in possible_code_cols:
+                if col in gdf.columns:
+                    code_col = col
+                    break
+        
+        if name_col is None:
+            possible_name_cols = ['ADM_NM', 'SIG_NM', 'SIGUN_NM', 'NM']
+            for col in possible_name_cols:
+                if col in gdf.columns:
                     name_col = col
                     break
-    
-    if name_col is None:
-        raise Exception("지역명 컬럼을 찾을 수 없습니다")
-    
-    gdf = gdf[['geometry', name_col]].copy()
-    gdf.rename(columns={name_col: '행정구역'}, inplace=True)
-    gdf['행정구역'] = gdf['행정구역'].astype(str).str.strip()
-    
-    # 경상북도 지역만 필터링
-    gyeongbuk_pattern = '|'.join(REGIONS)
-    gdf = gdf[gdf['행정구역'].str.contains(gyeongbuk_pattern, na=False, regex=True)]
-    gdf = gdf[~gdf.geometry.is_empty]
-    
-    # 포항시 통합
-    gdf.loc[gdf['행정구역'].str.contains('포항시', na=False), '행정구역'] = '포항시'
-    
-    # 중복 지역 통합
-    duplicate_regions = gdf['행정구역'].value_counts()
-    if len(duplicate_regions[duplicate_regions > 1]) > 0:
-        gdf_list = []
-        for region in gdf['행정구역'].unique():
-            region_gdf = gdf[gdf['행정구역'] == region]
-            if len(region_gdf) > 1:
-                unified_geometry = region_gdf.geometry.unary_union
-                gdf_list.append({'행정구역': region, 'geometry': unified_geometry})
-            else:
-                gdf_list.append({'행정구역': region, 'geometry': region_gdf.geometry.iloc[0]})
-        gdf_final = gpd.GeoDataFrame(gdf_list, crs='EPSG:4326')
-    else:
-        gdf_final = gdf.copy()
-    
-    return gdf_final
+        
+        print(f"경상북도 사용할 코드 컬럼: {code_col}")
+        print(f"경상북도 사용할 이름 컬럼: {name_col}")
+        
+        # 컬럼을 찾은 경우에만 진행
+        if code_col and name_col:
+            # 필요한 컬럼만 유지
+            gdf = gdf[['geometry', code_col, name_col]].copy()
+            
+            # 컬럼명 표준화
+            gdf = gdf.rename(columns={code_col: 'SGG_CD', name_col: 'SGG_NM'})
+            
+            # 행정구역명 정리
+            gdf['SGG_NM'] = gdf['SGG_NM'].astype(str).str.strip()
+            gdf['SGG_NM'] = gdf['SGG_NM'].str.replace(r'^경상북도\s*', '', regex=True)
+            
+            print(f"경상북도 정리 전 지역명 샘플: {gdf['SGG_NM'].head().tolist()}")
+            
+            # 경상북도 시군 필터링
+            pattern = '|'.join(REGIONS)
+            gdf = gdf[gdf['SGG_NM'].str.contains(pattern, na=False, regex=True)]
+            gdf = gdf[~gdf.geometry.is_empty]
+            
+            print(f"경상북도 필터링 후 지역 수: {len(gdf)}")
+            print(f"경상북도 포함된 지역: {sorted(gdf['SGG_NM'].unique())}")
+
+            # 지오메트리 단순화로 메모리 절약
+            gdf['geometry'] = gdf['geometry'].simplify(0.01)
+
+            # 포항시 통합 (필요한 경우)
+            gdf.loc[gdf['SGG_NM'].str.contains('포항시', na=False), 'SGG_NM'] = '포항시'
+
+            # 중복 통합
+            if gdf['SGG_NM'].duplicated().any():
+                print("경상북도 중복 지역 통합 중...")
+                gdf_list = []
+                for region in gdf['SGG_NM'].unique():
+                    sub = gdf[gdf['SGG_NM'] == region]
+                    geometry = sub.geometry.unary_union if len(sub) > 1 else sub.geometry.iloc[0]
+                    gdf_list.append({'SGG_NM': region, 'geometry': geometry})
+                gdf = gpd.GeoDataFrame(gdf_list, crs='EPSG:4326')
+
+            # 컬럼명 변경 (기존 코드와 호환성 유지)
+            gdf = gdf.rename(columns={'SGG_NM': '행정구역'})
+            
+            # category 타입으로 최적화
+            gdf['행정구역'] = gdf['행정구역'].astype('category')
+            
+            # 메모리 정리
+            gc.collect()
+            
+            print(f"경상북도 Shapefile 로딩 완료: {len(gdf)}개 시군구")
+            return gdf
+            
+        else:
+            print("경상북도 적절한 컬럼을 찾을 수 없습니다.")
+            print(f"경상북도 전체 컬럼 목록: {list(gdf.columns)}")
+            raise Exception("경상북도 컬럼 매핑 실패")
+            
+    except Exception as e:
+        print(f"경상북도 shapefile 로딩 오류: {e}")
+        raise e
 
 try:
-    gdf_gyeongbuk = load_and_optimize_shapefile(DATA_DIR / "BND_SIGUNGU_PG.shp")
+    gdf_gyeongbuk = load_and_optimize_shapefile(DATA_DIR / "DA_SIG_202307.shp")
     unique_gyeongbuk_areas = sorted(gdf_gyeongbuk['행정구역'].unique())
+    print(f"경상북도 최종 지역 목록: {unique_gyeongbuk_areas}")
 except Exception as e:
     print(f"경상북도 shapefile 로딩 오류: {e}")
+    print("경상북도 기존 방식으로 대체합니다.")
     gdf_gyeongbuk = gpd.GeoDataFrame()
     unique_gyeongbuk_areas = []
 
-# ====== [7] 경상북도 분석 함수들 ======
+# ====== 영천시 지도 생성 함수 (수정된 버전) ======
+def create_yeongcheon_map(selected_marker=None, map_type="normal", locations=None, selected_area=None):
+    """영천시 지도 생성 (수정된 버전)"""
+    if df_yeongcheon.empty:
+        return "<div>지도 데이터를 불러올 수 없습니다.</div>"
+    
+    # 기본 중심점과 줌 레벨
+    center_lat, center_lng = 35.961380, 128.927778
+    zoom = 11
+
+    if locations is None:
+        locations = pd.DataFrame()
+
+    # 1. 읍면동 선택에 따른 지도 중심/줌 결정 (우선순위 높음)
+    if selected_area and selected_area != "전체" and not gdf_yeongcheon.empty:
+        # 표준화된 컬럼명 사용
+        area_gdf = gdf_yeongcheon[gdf_yeongcheon['ADM_NM'] == selected_area]
+        if not area_gdf.empty:
+            bounds = area_gdf.total_bounds
+            center_lat = (bounds[1] + bounds[3]) / 2
+            center_lng = (bounds[0] + bounds[2]) / 2
+            zoom = 13
+            
+    # 2. 저수지가 선택되었고 locations에 해당 저수지가 있을 때만 위치 변경
+    elif selected_marker and not locations.empty and selected_marker in locations['시설명'].values:
+        selected = locations[locations['시설명'] == selected_marker]
+        if not selected.empty:
+            center_lat, center_lng = selected.iloc[0]['위도'], selected.iloc[0]['경도']
+            zoom = 15
+
+    m = folium.Map(
+        location=[center_lat, center_lng], 
+        zoom_start=zoom, 
+        width="100%", 
+        height="100%",
+        max_zoom=18,
+        zoom_control=False,
+        prefer_canvas=True  # 캔버스 렌더링으로 메모리 절약
+    )
+    
+    if map_type == "satellite":
+        folium.TileLayer(
+            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            attr="ESRI", 
+            name="위성 지도", 
+            control=False,
+            max_zoom=18
+        ).add_to(m)
+    else:
+        folium.TileLayer(
+            "OpenStreetMap", 
+            name="일반 지도", 
+            control=False,
+            max_zoom=19
+        ).add_to(m)
+
+    # 현재 지도 상태 유지를 위한 JavaScript 추가
+    preserve_state_script = f"""
+    <script>
+    var selectedReservoir = "{selected_marker if selected_marker else ""}";
+    var isReservoirSelected = selectedReservoir !== "" && selectedReservoir !== "None";
+    
+    setTimeout(function() {{
+        var mapElement = document.querySelector('.folium-map');
+        if (mapElement) {{
+            var leafletMap = window[mapElement.id];
+            if (leafletMap) {{
+                if (!isReservoirSelected && sessionStorage.getItem('mapZoom') && sessionStorage.getItem('mapCenter')) {{
+                    var savedZoom = parseInt(sessionStorage.getItem('mapZoom'));
+                    var savedCenter = JSON.parse(sessionStorage.getItem('mapCenter'));
+                    leafletMap.setView([savedCenter.lat, savedCenter.lng], savedZoom);
+                }} else if (isReservoirSelected) {{
+                    setTimeout(function() {{
+                        var currentZoom = leafletMap.getZoom();
+                        var currentCenter = leafletMap.getCenter();
+                        sessionStorage.setItem('mapZoom', currentZoom);
+                        sessionStorage.setItem('mapCenter', JSON.stringify({{
+                            lat: currentCenter.lat,
+                            lng: currentCenter.lng
+                        }}));
+                    }}, 1000);
+                }}
+                
+                leafletMap.on('zoomend moveend', function() {{
+                    setTimeout(function() {{
+                        var currentZoom = leafletMap.getZoom();
+                        var currentCenter = leafletMap.getCenter();
+                        sessionStorage.setItem('mapZoom', currentZoom);
+                        sessionStorage.setItem('mapCenter', JSON.stringify({{
+                            lat: currentCenter.lat,
+                            lng: currentCenter.lng
+                        }}));
+                    }}, 100);
+                }});
+            }}
+        }}
+    }}, 500);
+    </script>
+    """
+
+    # 행정구역 경계 (표준화된 컬럼명 사용)
+    if not gdf_yeongcheon.empty:
+        folium.GeoJson(
+            gdf_yeongcheon,
+            name="영천시 읍면동 경계",
+            style_function=lambda x: {
+                'fillColor': 'transparent', 
+                'color': 'DarkGreen', 
+                'weight': 2,
+                'fillOpacity': 0,
+                'opacity': 0.7
+            },
+            # 표준화된 컬럼명으로 툴팁 수정
+            tooltip=folium.GeoJsonTooltip(
+                fields=["ADM_NM"],
+                aliases=["행정동:"],
+                sticky=True
+            )
+        ).add_to(m)
+
+    # 선택된 저수지 마커 표시
+    if not locations.empty:
+        for _, row in locations.iterrows():
+            color = 'red' if selected_marker == row['시설명'] else 'blue'
+            folium.Marker(
+                location=[row['위도'], row['경도']],
+                tooltip=row['시설명'],
+                icon=folium.Icon(color=color)
+            ).add_to(m)
+
+    # 모든 저수지 점 표시
+    for _, row in df_yeongcheon.iterrows():
+        if locations.empty or row['시설명'] not in locations['시설명'].values:
+            folium.CircleMarker(
+                location=[row['위도'], row['경도']],
+                radius=3, 
+                color='#1E90FF', 
+                fill=True, 
+                fill_color='#1E90FF', 
+                fill_opacity=0.6,
+                tooltip=f"{row['시설명']} ({row['행정동명']})"
+            ).add_to(m)
+
+    # JavaScript 추가
+    m.get_root().html.add_child(folium.Element(preserve_state_script))
+
+    return m._repr_html_()
+
+# ====== [8] 경상북도 분석 함수들 ======
 def analyze_air_pollution_data(file_path: str) -> pd.DataFrame:
     """대기오염 데이터 분석"""
     pollutants = {
@@ -270,23 +686,31 @@ def analyze_air_pollution_data(file_path: str) -> pd.DataFrame:
         'NO2': '이산화질소_월별_도시별_대기오염도'
     }
     
-    result_df = None
+    result_dfs = []
     for pollutant, sheet_name in pollutants.items():
         try:
-            df = pd.read_excel(file_path, sheet_name=sheet_name)
+            df = pd.read_excel(file_path, sheet_name=sheet_name, engine='openpyxl')
             gyeongbuk_df = df[df['구분(1)'] == '경상북도']
             month_cols = [col for col in df.columns if str(col).replace('.', '').isdigit()]
             avg_df = gyeongbuk_df.groupby('구분(2)')[month_cols].mean().mean(axis=1).reset_index()
             avg_df.columns = ['시군구', f'{pollutant}_평균']
+            avg_df = optimize_dataframe_memory(avg_df)
+            result_dfs.append(avg_df)
             
-            if result_df is None:
-                result_df = avg_df
-            else:
-                result_df = pd.merge(result_df, avg_df, on='시군구', how='outer')
+            # 메모리 정리
+            del df, gyeongbuk_df
+            gc.collect()
+            
         except Exception as e:
             pass
     
-    return result_df
+    if result_dfs:
+        result_df = result_dfs[0]
+        for df in result_dfs[1:]:
+            result_df = pd.merge(result_df, df, on='시군구', how='outer')
+        return optimize_dataframe_memory(result_df)
+    
+    return pd.DataFrame()
 
 def analyze_crime_rate(crime_file_path, population_file_path):
     """범죄율 데이터 분석"""
@@ -306,7 +730,12 @@ def analyze_crime_rate(crime_file_path, population_file_path):
     merged = pd.merge(crime_data[['region', '총범죄건수']], pop_df, on="region", how="inner")
     merged["범죄율"] = merged["총범죄건수"] / merged["population"]
     merged = merged.sort_values("범죄율", ascending=False)
-    return merged
+    
+    # 메모리 정리
+    del crime_df, pop_raw, pop_df, crime_data
+    gc.collect()
+    
+    return optimize_dataframe_memory(merged)
 
 def analyze_accident_data(excel_path: str) -> pd.DataFrame:
     """교통사고 데이터 분석"""
@@ -330,11 +759,11 @@ def analyze_accident_data(excel_path: str) -> pd.DataFrame:
 
     city_accident_avg = {city: sum(values) / len(values) for city, values in city_accident_avg.items()}
     acc_df = pd.DataFrame({'시군': list(city_accident_avg.keys()), '평균사고건수': list(city_accident_avg.values())})
-    pop_df_local = pd.DataFrame({'시군': REGIONS, '인구수': POPULATION})
-    merged_df = pd.merge(acc_df, pop_df_local, on='시군')
+    merged_df = pd.merge(acc_df, pop_df, on='시군')
     merged_df['사고비율'] = merged_df['평균사고건수'] / merged_df['인구수']
     merged_df = merged_df.sort_values("사고비율", ascending=False)
-    return merged_df
+    
+    return optimize_dataframe_memory(merged_df)
 
 def analyze_park_area(excel_path: str) -> pd.DataFrame:
     """공원면적 데이터 분석"""
@@ -346,7 +775,8 @@ def analyze_park_area(excel_path: str) -> pd.DataFrame:
     merged_df['인구수'] = pd.to_numeric(merged_df['인구수'], errors='coerce')
     merged_df['공원면적비율'] = merged_df['면적'] / merged_df['인구수']
     merged_df = merged_df.sort_values("공원면적비율", ascending=True)
-    return merged_df
+    
+    return optimize_dataframe_memory(merged_df)
 
 def analyze_population_facility_ratio(facility_file_path: str, population_file_path: str) -> pd.DataFrame:
     """반려동물 시설 데이터 분석"""
@@ -363,153 +793,168 @@ def analyze_population_facility_ratio(facility_file_path: str, population_file_p
     df_merge = pd.merge(df_fac_cnt, pop_df_local, on="region")
     df_merge["per_person"] = df_merge["facility_count"] / df_merge["population"]
     df_merge = df_merge.sort_values("per_person", ascending=True)
-    return df_merge
+    
+    # 메모리 정리
+    del facility_df, pop_raw, pop_df_local, df_fac_cnt
+    gc.collect()
+    
+    return optimize_dataframe_memory(df_merge)
 
-# ====== [8] 레이더 차트 함수 ======
+# ====== [9] 레이더 차트 함수 ======
 def plot_radar_chart(park_fp, acc_fp, facility_fp, pop_fp, crime_fp, pollution_fp, selected_regions=None):
     """종합 레이더 차트"""
-    # 데이터 준비 및 분석 (기존 코드와 동일)
-    df_park = pd.read_excel(park_fp).iloc[3:,[1,3]]
-    df_park.columns = ['시군','면적']
-    df_park['면적'] = pd.to_numeric(df_park['면적'],errors='coerce')
-    df_park = df_park.merge(pop_df, on='시군')
-    df_park['per_person'] = df_park['면적'] / df_park['인구수']
-    df_park['park_norm'] = df_park['per_person'] / df_park['per_person'].max()
+    try:
+        # 데이터 준비 및 분석
+        df_park = pd.read_excel(park_fp).iloc[3:,[1,3]]
+        df_park.columns = ['시군','면적']
+        df_park['면적'] = pd.to_numeric(df_park['면적'],errors='coerce')
+        df_park = df_park.merge(pop_df, on='시군')
+        df_park['per_person'] = df_park['면적'] / df_park['인구수']
+        df_park['park_norm'] = (df_park['per_person'] / df_park['per_person'].max()).astype(np.float32)
 
-    # 교통사고 분석
-    df_acc = pd.read_excel(acc_fp)
-    df_acc = df_acc[df_acc['구분'] == '사고'].drop(columns=['연도','구분'])
-    acc_mean = df_acc.mean()
-    mapping_acc = {
-        '포항북부':'포항시','포항남부':'포항시','경주':'경주시','김천':'김천시','안동':'안동시','구미':'구미시',
-        '영주':'영주시','영천':'영천시','상주':'상주시','문경':'문경시','경산':'경산시','의성':'의성군',
-        '청송':'청송군','영양':'영양군','영덕':'영덕군','청도':'청도군','고령':'고령군','성주':'성주군',
-        '칠곡':'칠곡군','예천':'예천군','봉화':'봉화군','울진':'울진군','울릉':'울릉군'
-    }
-    acc_dict = {}
-    for k, v in acc_mean.items():
-        city = mapping_acc.get(k)
-        if city:
-            acc_dict.setdefault(city, []).append(v)
-    acc_avg = {city: np.mean(vals) for city, vals in acc_dict.items()}
-    df_acc2 = pd.DataFrame.from_dict(acc_avg, orient='index', columns=['acc']).reset_index().rename(columns={'index': '시군'})
-    df_acc2 = df_acc2.merge(pop_df, on='시군')
-    df_acc2['acc_inv'] = 1 / (df_acc2['acc'] / df_acc2['인구수'])
-    df_acc2['acc_norm'] = df_acc2['acc_inv'] / df_acc2['acc_inv'].max()
+        # 교통사고 분석
+        df_acc = pd.read_excel(acc_fp)
+        df_acc = df_acc[df_acc['구분'] == '사고'].drop(columns=['연도','구분'])
+        acc_mean = df_acc.mean()
+        mapping_acc = {
+            '포항북부':'포항시','포항남부':'포항시','경주':'경주시','김천':'김천시','안동':'안동시','구미':'구미시',
+            '영주':'영주시','영천':'영천시','상주':'상주시','문경':'문경시','경산':'경산시','의성':'의성군',
+            '청송':'청송군','영양':'영양군','영덕':'영덕군','청도':'청도군','고령':'고령군','성주':'성주군',
+            '칠곡':'칠곡군','예천':'예천군','봉화':'봉화군','울진':'울진군','울릉':'울릉군'
+        }
+        acc_dict = {}
+        for k, v in acc_mean.items():
+            city = mapping_acc.get(k)
+            if city:
+                acc_dict.setdefault(city, []).append(v)
+        acc_avg = {city: np.mean(vals) for city, vals in acc_dict.items()}
+        df_acc2 = pd.DataFrame.from_dict(acc_avg, orient='index', columns=['acc']).reset_index().rename(columns={'index': '시군'})
+        df_acc2 = df_acc2.merge(pop_df, on='시군')
+        df_acc2['acc_inv'] = 1 / (df_acc2['acc'] / df_acc2['인구수'])
+        df_acc2['acc_norm'] = (df_acc2['acc_inv'] / df_acc2['acc_inv'].max()).astype(np.float32)
 
-    # 반려동물 시설 분석
-    df_fac = pd.read_csv(facility_fp, encoding='cp949')
-    df_fac = df_fac[df_fac['시도 명칭'] == '경상북도']
-    df_fac['시군'] = df_fac['시군구 명칭'].str.extract(r'^(.*?[시군])')[0]
-    df_fac = df_fac[df_fac['시군'] != '군위군']
-    fac_counts = df_fac['시군'].value_counts().rename_axis('시군').reset_index(name='facility_count')
-    fac_df = fac_counts.merge(pop_df, on='시군')
-    fac_df['per_person'] = fac_df['facility_count'] / fac_df['인구수']
-    fac_df['fac_norm'] = fac_df['per_person'] / fac_df['per_person'].max()
+        # 반려동물 시설 분석
+        df_fac = pd.read_csv(facility_fp, encoding='cp949')
+        df_fac = df_fac[df_fac['시도 명칭'] == '경상북도']
+        df_fac['시군'] = df_fac['시군구 명칭'].str.extract(r'^(.*?[시군])')[0]
+        df_fac = df_fac[df_fac['시군'] != '군위군']
+        fac_counts = df_fac['시군'].value_counts().rename_axis('시군').reset_index(name='facility_count')
+        fac_df = fac_counts.merge(pop_df, on='시군')
+        fac_df['per_person'] = fac_df['facility_count'] / fac_df['인구수']
+        fac_df['fac_norm'] = (fac_df['per_person'] / fac_df['per_person'].max()).astype(np.float32)
 
-    # 범죄 분석
-    crime_df = pd.read_excel(crime_fp)
-    cols = [c for c in crime_df.columns if c not in ['범죄대분류', '범죄중분류']]
-    crime_tot = crime_df[cols].sum().reset_index()
-    crime_tot.columns = ['raw', 'crime']
-    crime_tot['시군'] = crime_tot['raw'].str.split().str[0]
-    crime_tot = crime_tot[crime_tot['시군'] != '군위군'][['시군', 'crime']]
-    crime_tot = crime_tot.merge(pop_df, on='시군')
-    crime_tot['crime_inv'] = 1 / (crime_tot['crime'] / crime_tot['인구수'])
-    crime_tot['crime_norm'] = crime_tot['crime_inv'] / crime_tot['crime_inv'].max()
+        # 범죄 분석
+        crime_df = pd.read_excel(crime_fp)
+        cols = [c for c in crime_df.columns if c not in ['범죄대분류', '범죄중분류']]
+        crime_tot = crime_df[cols].sum().reset_index()
+        crime_tot.columns = ['raw', 'crime']
+        crime_tot['시군'] = crime_tot['raw'].str.split().str[0]
+        crime_tot = crime_tot[crime_tot['시군'] != '군위군'][['시군', 'crime']]
+        crime_tot = crime_tot.merge(pop_df, on='시군')
+        crime_tot['crime_inv'] = 1 / (crime_tot['crime'] / crime_tot['인구수'])
+        crime_tot['crime_norm'] = (crime_tot['crime_inv'] / crime_tot['crime_inv'].max()).astype(np.float32)
 
-    # 대기오염 분석
-    pollutants = {
-        'PM2.5': '미세먼지_PM2.5__월별_도시별_대기오염도',
-        'PM10': '미세먼지_PM10__월별_도시별_대기오염도',
-        'O3': '오존_월별_도시별_대기오염도',
-        'CO': '일산화탄소_월별_도시별_대기오염도',
-        'NO2': '이산화질소_월별_도시별_대기오염도'
-    }
-    polls = []
-    for pol, sheet in pollutants.items():
-        try:
-            dfp = pd.read_excel(pollution_fp, sheet_name=sheet)
-            dfp = dfp[dfp['구분(1)'] == '경상북도']
-            mcols = [c for c in dfp.columns if c not in ['구분(1)', '구분(2)']]
-            dfp[mcols] = dfp[mcols].apply(pd.to_numeric, errors='coerce')
-            avg = dfp.groupby('구분(2)')[mcols].mean().mean(axis=1).rename(pol)
-            polls.append(avg)
-        except:
-            pass
-    
-    if polls:
-        poll_df = pd.concat(polls, axis=1).reset_index().rename(columns={'구분(2)': '시군'})
-        poll_df['시군'] = poll_df['시군'].astype(str).apply(lambda x: x + '시' if not x.endswith(('시', '군')) else x)
-        for pol in pollutants:
-            if pol in poll_df.columns:
-                poll_df[f'{pol}_n'] = poll_df[pol] / poll_df[pol].max()
-        poll_cols = [f'{p}_n' for p in pollutants if f'{p}_n' in poll_df.columns]
-        poll_df['poll_comp'] = poll_df[poll_cols].sum(axis=1)
-        poll_df['poll_inv'] = 1 / poll_df['poll_comp']
-        poll_df['poll_norm'] = poll_df['poll_inv'] / poll_df['poll_inv'].max()
-    else:
-        poll_df = pd.DataFrame({'시군': REGIONS, 'poll_norm': [0.5] * len(REGIONS)})
-
-    # 통합 및 시각화
-    metrics = pd.DataFrame({'시군': REGIONS})
-    metrics = metrics.merge(df_park[['시군', 'park_norm']], on='시군', how='left')
-    metrics = metrics.merge(df_acc2[['시군', 'acc_norm']], on='시군', how='left')
-    metrics = metrics.merge(fac_df[['시군', 'fac_norm']], on='시군', how='left')
-    metrics = metrics.merge(crime_tot[['시군', 'crime_norm']], on='시군', how='left')
-    metrics = metrics.merge(poll_df[['시군', 'poll_norm']], on='시군', how='left')
-    
-    # 결측값 처리
-    metrics = metrics.fillna(0.5)
-
-    categories = ['산책 환경', '반려동물 시설', '교통 안전', '치안', '대기 환경']
-    theta = categories + [categories[0]]
-
-    fig = go.Figure()
-    
-    for _, row in metrics.iterrows():
-        values = [
-            row['park_norm'], row['fac_norm'], row['acc_norm'],
-            row['crime_norm'], row['poll_norm']
-        ] + [row['park_norm']]
-
-        is_selected = selected_regions and row['시군'] in selected_regions
-        region_color = REGION_COLORS.get(row['시군'], '#808080')
+        # 대기오염 분석
+        pollutants = {
+            'PM2.5': '미세먼지_PM2.5__월별_도시별_대기오염도',
+            'PM10': '미세먼지_PM10__월별_도시별_대기오염도',
+            'O3': '오존_월별_도시별_대기오염도',
+            'CO': '일산화탄소_월별_도시별_대기오염도',
+            'NO2': '이산화질소_월별_도시별_대기오염도'
+        }
+        polls = []
+        for pol, sheet in pollutants.items():
+            try:
+                dfp = pd.read_excel(pollution_fp, sheet_name=sheet)
+                dfp = dfp[dfp['구분(1)'] == '경상북도']
+                mcols = [c for c in dfp.columns if c not in ['구분(1)', '구분(2)']]
+                dfp[mcols] = dfp[mcols].apply(pd.to_numeric, errors='coerce')
+                avg = dfp.groupby('구분(2)')[mcols].mean().mean(axis=1).rename(pol)
+                polls.append(avg)
+            except:
+                pass
         
-        if is_selected:
-            def hex_to_rgb(hex_color):
-                hex_color = hex_color.lstrip('#')
-                return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
-            
-            rgb = hex_to_rgb(region_color)
-            fill_color = f'rgba({rgb[0]}, {rgb[1]}, {rgb[2]}, 0.2)'
-            
-            fig.add_trace(go.Scatterpolar(
-                r=values, theta=theta, name=row['시군'],
-                line=dict(width=3, color=region_color),
-                opacity=1.0, fill='toself', fillcolor=fill_color
-            ))
+        if polls:
+            poll_df = pd.concat(polls, axis=1).reset_index().rename(columns={'구분(2)': '시군'})
+            poll_df['시군'] = poll_df['시군'].astype(str).apply(lambda x: x + '시' if not x.endswith(('시', '군')) else x)
+            for pol in pollutants:
+                if pol in poll_df.columns:
+                    poll_df[f'{pol}_n'] = (poll_df[pol] / poll_df[pol].max()).astype(np.float32)
+            poll_cols = [f'{p}_n' for p in pollutants if f'{p}_n' in poll_df.columns]
+            poll_df['poll_comp'] = poll_df[poll_cols].sum(axis=1)
+            poll_df['poll_inv'] = 1 / poll_df['poll_comp']
+            poll_df['poll_norm'] = (poll_df['poll_inv'] / poll_df['poll_inv'].max()).astype(np.float32)
         else:
-            fig.add_trace(go.Scatterpolar(
-                r=values, theta=theta, name=row['시군'],
-                line=dict(width=1, color='lightgray'),
-                opacity=0.2, showlegend=False
-            ))
+            poll_df = pd.DataFrame({'시군': REGIONS, 'poll_norm': [0.5] * len(REGIONS)})
 
-    fig.update_layout(
-        polar=dict(
-            radialaxis=dict(visible=True, range=[0, 1], side="clockwise", angle=90),
-            angularaxis=dict(rotation=90, direction="clockwise")
-        ),
-        showlegend=True,
-        legend=dict(orientation='h', x=0.5, xanchor='center', y=-0.2),
-        width=520, height=500,
-        margin=dict(t=20, b=0, l=0, r=0)
-    )
+        # 통합 및 시각화
+        metrics = pd.DataFrame({'시군': REGIONS})
+        metrics = metrics.merge(df_park[['시군', 'park_norm']], on='시군', how='left')
+        metrics = metrics.merge(df_acc2[['시군', 'acc_norm']], on='시군', how='left')
+        metrics = metrics.merge(fac_df[['시군', 'fac_norm']], on='시군', how='left')
+        metrics = metrics.merge(crime_tot[['시군', 'crime_norm']], on='시군', how='left')
+        metrics = metrics.merge(poll_df[['시군', 'poll_norm']], on='시군', how='left')
+        
+        # 결측값 처리
+        metrics = metrics.fillna(0.5)
+        metrics = optimize_dataframe_memory(metrics)
 
-    return fig
+        categories = ['산책 환경', '반려동물 시설', '교통 안전', '치안', '대기 환경']
+        theta = categories + [categories[0]]
 
-# ====== [9] 지도 생성 함수들 ======
+        fig = go.Figure()
+        
+        for _, row in metrics.iterrows():
+            values = [
+                row['park_norm'], row['fac_norm'], row['acc_norm'],
+                row['crime_norm'], row['poll_norm']
+            ] + [row['park_norm']]
+
+            is_selected = selected_regions and row['시군'] in selected_regions
+            region_color = REGION_COLORS.get(row['시군'], '#808080')
+            
+            if is_selected:
+                def hex_to_rgb(hex_color):
+                    hex_color = hex_color.lstrip('#')
+                    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+                
+                rgb = hex_to_rgb(region_color)
+                fill_color = f'rgba({rgb[0]}, {rgb[1]}, {rgb[2]}, 0.2)'
+                
+                fig.add_trace(go.Scatterpolar(
+                    r=values, theta=theta, name=row['시군'],
+                    line=dict(width=3, color=region_color),
+                    opacity=1.0, fill='toself', fillcolor=fill_color
+                ))
+            else:
+                fig.add_trace(go.Scatterpolar(
+                    r=values, theta=theta, name=row['시군'],
+                    line=dict(width=1, color='lightgray'),
+                    opacity=0.2, showlegend=False
+                ))
+
+        fig.update_layout(
+            polar=dict(
+                radialaxis=dict(visible=True, range=[0, 1], side="clockwise", angle=90),
+                angularaxis=dict(rotation=90, direction="clockwise")
+            ),
+            showlegend=True,
+            legend=dict(orientation='h', x=0.5, xanchor='center', y=-0.2),
+            width=520, height=500,
+            margin=dict(t=20, b=0, l=0, r=0)
+        )
+
+        # 메모리 정리
+        del df_park, df_acc, df_acc2, df_fac, fac_df, crime_df, crime_tot, poll_df, metrics
+        gc.collect()
+
+        return fig
+        
+    except Exception as e:
+        print(f"레이더 차트 생성 오류: {e}")
+        return go.Figure()
+
+# ====== [10] 지도 생성 함수들 ======
 def create_gyeongbuk_map(selected_regions=None):
     """경상북도 지도 생성"""
     if gdf_gyeongbuk.empty:
@@ -524,7 +969,8 @@ def create_gyeongbuk_map(selected_regions=None):
         zoom_start=8,
         tiles="OpenStreetMap",
         prefer_canvas=True,
-        zoom_control=False
+        zoom_control=False,
+        max_zoom=12  # 최대 줌 제한으로 메모리 절약
     )
 
     def style_function(feature):
@@ -598,9 +1044,9 @@ def create_yeongcheon_map(selected_marker=None, map_type="normal", locations=Non
             bounds = area_gdf.total_bounds
             center_lat = (bounds[1] + bounds[3]) / 2
             center_lng = (bounds[0] + bounds[2]) / 2
-            zoom = 13  # 읍면동 확대
+            zoom = 13
             
-    # 2. 저수지가 선택되었고 locations에 해당 저수지가 있을 때만 위치 변경 (우선순위 낮음)
+    # 2. 저수지가 선택되었고 locations에 해당 저수지가 있을 때만 위치 변경
     elif selected_marker and not locations.empty and selected_marker in locations['시설명'].values:
         selected = locations[locations['시설명'] == selected_marker]
         if not selected.empty:
@@ -613,7 +1059,8 @@ def create_yeongcheon_map(selected_marker=None, map_type="normal", locations=Non
         width="100%", 
         height="100%",
         max_zoom=18,
-        zoom_control=False
+        zoom_control=False,
+        prefer_canvas=True  # 캔버스 렌더링으로 메모리 절약
     )
     
     if map_type == "satellite":
@@ -737,8 +1184,70 @@ def create_barplot(data):
     )
     return ui.HTML(fig.to_html(full_html=False, include_plotlyjs='embed', config={'displayModeBar': False}))
 
-# ====== [10] CSS 스타일 ======
+# ====== [11] CSS 스타일 ======
 custom_css = """
+/* ─ 배경 이미지 + 어두운 오버레이 ─ */
+.welcome-background {
+  /* 1) 배경 이미지는 그대로 */
+  background-image: url('bg.png');
+  background-size: cover;
+  background-position: center;
+
+  /* 2) 반투명 흰색 오버레이를 위에 쌓기 */
+  background-repeat: no-repeat;
+  background-blend-mode: overlay;
+  background-color: rgba(255,255,255,0.8);
+
+  /* 3) 기존 위치/크기 설정 유지 */
+  position: fixed;
+  top: 60px;             /* 헤더 높이만큼 아래로 */
+  left: 0;
+  width: 100%;
+  height: calc(100vh - 60px);
+  z-index: -1;
+}
+
+/* ─ 중앙 콘텐츠 박스 ─ */
+.welcome-container {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  height: calc(100vh - 60px);
+  text-align: center;
+  padding: 0 20px;
+}
+
+/* ─ 제목/부제목 ─ */
+.welcome-title {
+  font-size: 2.5rem;
+  color: #000;                /* 흰색에서 검정색으로 */
+  text-shadow: none;          /* 그림자 제거 */
+  margin-bottom: 0.5rem;
+}
+.welcome-subtitle {
+  font-size: 1.25rem;
+  color: #000;                /* 흰색에서 검정색으로 */
+  margin-bottom: 2rem;
+}
+
+/* ─ 시작 버튼 ─ */
+.start-button {
+  font-size: 1.125rem;
+  padding: 0.75rem 2rem;
+  background-color: #1e3a8a;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+  cursor: pointer;
+  transition: background-color 0.3s ease, transform 0.2s ease;
+}
+.start-button:hover {
+  background-color: #002c5f;
+  transform: translateY(-2px);
+}
+
 /* 헤더 스타일 */
 #header {
     display: flex;
@@ -893,7 +1402,7 @@ h4 {
 }
 """
 
-# ====== [11] UI 구성 ======
+# ====== [12] UI 구성 ======
 app_ui = ui.page_fluid(
     ui.tags.style(custom_css),
     
@@ -902,7 +1411,7 @@ app_ui = ui.page_fluid(
         ui.div(
             # 좌측: 로고 + 제목
             ui.div(
-                tags.img(src="/logo1.png", height="28px", style="margin-right: 10px;"),
+                tags.img(src="logo.png", height="28px", style="margin-right: 10px;"),
                 ui.h3("영천시 반려동물 산책로 분석 대시보드", style="margin: 0; font-size: 18px; color: white;"),
                 style="display: flex; align-items: center;"
             ),
@@ -1034,199 +1543,238 @@ app_ui = ui.page_fluid(
             z-index: 9999;
         """
     ),
-
-    # 조건부 컨텐츠
-    ui.panel_conditional("input.top_tab == '경상북도'", ui.output_ui("gyeongbuk_ui")),
-    ui.panel_conditional("input.top_tab == '영천시'", ui.output_ui("yeongcheon_ui")),
+    ui.output_ui("main_content", style="padding-top: 60px;"),
+    
 )
 
-# ====== [12] 서버 함수 ======
+# ====== [13] 서버 함수 ======
 def server(input, output, session):
+    # 메모리 사용량 로깅
+    log_memory_usage("서버 시작")
+    
+    # 캐싱된 데이터 (메모리 효율적)
+    _cached_data = {}
+    
+    def get_cached_or_compute(key, compute_func, *args, **kwargs):
+        """캐싱 기능이 있는 계산 함수"""
+        if key not in _cached_data:
+            _cached_data[key] = compute_func(*args, **kwargs)
+            # 캐시 크기 제한
+            if len(_cached_data) > 10:
+                oldest_key = next(iter(_cached_data))
+                del _cached_data[oldest_key]
+                gc.collect()
+        return _cached_data[key]
+    
+    app_started = reactive.Value(False)
+
+    @reactive.Effect
+    @reactive.event(input.start_app)
+    def _():
+        app_started.set(True)
+    
     # 탭 변경 감지
     @reactive.Effect
     @reactive.event(input.top_tab)
     def on_tab_change():
         print(f"선택된 탭: {input.top_tab()}")
+        log_memory_usage(f"탭 변경: {input.top_tab()}")
 
     # 경상북도 UI
-    @output
+    @output()
     @render.ui
-    def gyeongbuk_ui():
-        return ui.TagList(
-            # 지도
-            ui.output_ui(
-                "gyeongbuk_map",
-                style="""
-                    position: fixed;
-                    top: 60px;
-                    left: 0;
-                    width: 100vw;
-                    height: calc(100vh - 60px);
-                    z-index: -1;
-                """
-            ),
-
-            # 사이드바 토글 버튼
-            ui.tags.button(
-                "〈",
-                id="gyeongbuk-toggle-button",
-                onclick="""
-                    const sidebar = document.getElementById('gyeongbuk-sidebar');
-                    const btn = document.getElementById('gyeongbuk-toggle-button');
-                    const isClosed = sidebar.style.transform === 'translateX(-280px)';
-                    sidebar.style.transform = isClosed ? 'translateX(0)' : 'translateX(-280px)';
-                    sidebar.classList.toggle('open', !isClosed);
-                    btn.innerText = isClosed ? '〈' : '〉';
-                    btn.style.left = isClosed ? '300px' : '20px';
-                """
-            ),
-
-            # 사이드바
-            ui.div(
-                ui.h3("경상북도 지역 선택", style="margin-bottom: 20px;"),
-                ui.input_checkbox_group(
-                    "gyeongbuk_selected_areas", 
-                    "", 
-                    choices={
-                        area: ui.HTML(f"""
-                            <span style="display: inline-flex; align-items: center;">
-                                {area}
-                                <span style="
-                                    display: inline-block;
-                                    width: 12px;
-                                    height: 12px;
-                                    background-color: {REGION_COLORS.get(area, '#808080')};
-                                    border-radius: 50%;
-                                    margin-left: 8px;
-                                    border: 1px solid #ddd;
-                                "></span>
-                            </span>
-                        """) for area in unique_gyeongbuk_areas
-                    },
-                    selected=[]
-                ),
-                
-                ui.div(
-                    ui.tags.button(
-                        "모두선택",
-                        onclick="""
-                            const checkboxes = document.querySelectorAll("input[type='checkbox'][name='gyeongbuk_selected_areas']");
-                            checkboxes.forEach(checkbox => {
-                                if (!checkbox.checked) {
-                                    checkbox.click();
-                                }
-                            });
-                        """,
-                        style="width: 44%; padding: 8px; background-color: #2196F3; color: white; border: none; border-radius: 4px; font-size: 12px; font-weight: bold; cursor: pointer; margin-right: 4%;"
-                    ),
-                    ui.tags.button(
-                        "모두해제",
-                        onclick="""
-                            const checkboxes = document.querySelectorAll("input[type='checkbox'][name='gyeongbuk_selected_areas']");
-                            checkboxes.forEach(checkbox => {
-                                if (checkbox.checked) {
-                                    checkbox.click();
-                                }
-                            });
-                        """,
-                        style="width: 44%; padding: 8px; background-color: #f44336; color: white; border: none; border-radius: 4px; font-size: 12px; font-weight: bold; cursor: pointer;"
-                    ),
-                    style="margin-top: 10px; margin-bottom: 15px; display: flex;"
-                ),
-                
-                ui.input_action_button("gyeongbuk_apply_selection", "선택 지역 분석하기", 
-                                    style="width: 92%; margin-top: 10px; padding: 10px; background-color: #4caf50; color: white; border: none; border-radius: 5px; font-weight: bold;"),
-                id="gyeongbuk-sidebar",
-                class_="open"
-            ),
-
-            # 팝업 창들
-            ui.output_ui("gyeongbuk_popup"),
-            ui.output_ui("gyeongbuk_details")
-        )
-
-    # 영천시 UI
-    @output
-    @render.ui  
-    def yeongcheon_ui():
-        return ui.TagList(
-            # 지도
-            ui.output_ui(
-                "yeongcheon_map",
-                style="""
-                    position: fixed;
-                    top: 60px;
-                    left: 0;
-                    width: 100vw;
-                    height: calc(100vh - 60px);
-                    z-index: -1;
-                """
-            ),
-
-            # 사이드바 토글 버튼
-            ui.tags.button(
-                "〈",
-                id="yeongcheon-toggle-button",
-                onclick="""
-                    const sidebar = document.getElementById('yeongcheon-sidebar');
-                    const btn = document.getElementById('yeongcheon-toggle-button');
-                    const isClosed = sidebar.style.transform === 'translateX(-280px)';
-                    sidebar.style.transform = isClosed ? 'translateX(0)' : 'translateX(-280px)';
-                    btn.innerText = isClosed ? '〈' : '〉';
-                    btn.style.left = isClosed ? '300px' : '20px';
-                """
-            ),
-
-            # 사이드바
-            ui.div(
-                ui.h3("영천시 저수지 분석", style="margin-bottom: 20px;"),
-                ui.div(
-                    ui.h4("저수지 필터링"),
-                    ui.input_select("yeongcheon_area", "읍면동 선택", choices=unique_areas, selected="전체"),
-                    ui.input_numeric("yeongcheon_top_n", "상위 저수지 개수", value=10, min=1, max=len(df_yeongcheon) if not df_yeongcheon.empty else 10),
-                    class_="sidebar-section"
-                ),
-                ui.div(
-                    ui.h4("가중치 설정"),
-                    ui.input_slider("yeongcheon_weight_area", "면적 가중치", min=0, max=1, value=0.3, step=0.05),
-                    ui.input_slider("yeongcheon_weight_perimeter", "둘레 가중치", min=0, max=1, value=0.3, step=0.05),
-                    ui.input_slider("yeongcheon_weight_distance", "거리 가중치", min=0, max=1, value=0.2, step=0.05),
-                    ui.input_slider("yeongcheon_weight_facilities", "시설수 가중치", min=0, max=1, value=0.2, step=0.05),
-                    ui.input_action_button("yeongcheon_apply_filters", "입력", class_="btn btn-primary"),
-                    class_="sidebar-section"
-                ),
-                id="yeongcheon-sidebar"
-            ),
-
-            # 지도 타입 선택
-            ui.div(
-                ui.input_radio_buttons(
-                    "yeongcheon_map_type", "지도 종류 선택",
-                    choices={"normal": "일반 지도", "satellite": "위성 지도"},
-                    selected="normal", inline=True
-                ),
-                style="position: fixed; bottom: 20px; right: 20px; z-index: 9999; background-color: rgba(255,255,255,0.95); padding: 15px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.2); max-width: 300px;"
-            ),
-
-            # 동적 리스트와 차트
-            ui.output_ui("yeongcheon_dynamic_list"),
-            ui.output_ui("yeongcheon_dynamic_chart"),
-
-            # 설명 박스
-            ui.div(
-                ui.output_ui("yeongcheon_description"),
-                style="""
-                    position: fixed;
-                    top: 80px;
-                    right: 20px;
-                    z-index: 9999;
-                    background-color: rgba(255,255,255,0.95);
-                    padding: 15px;
-                    border-radius: 8px;
-                    box-shadow: 0 2px 10px rgba(0,0,0,0.2);
-                    max-width: 350px;
-                """
+    def main_content():
+        # 1) 시작 전: 웰컴 페이지
+        if not app_started():
+            # 환영 페이지
+            return ui.div(
+                ui.tags.div({"class":"welcome-background"}),
+                ui.div({"class":"welcome-container"},
+                    ui.h1("함께살개냥 : 영천시 반려동물 친화 환경 분석",
+                          {"class":"welcome-title"}),
+                    ui.p("영천을 반려동물친화도시로 만들기 위한 개선안 제안",
+                          {"class":"welcome-subtitle"}),
+                    ui.input_action_button("start_app", "시작하기",
+                                           class_="start-button")
+                )
             )
+        
+         # 2) 시작 후: 두 개의 탭을 분기
+        if input.top_tab() == "경상북도":
+            # 원래의 gyeongbuk_ui() 내용 그대로 복사
+            return ui.TagList(
+                # 지도
+                ui.output_ui(
+                    "gyeongbuk_map",
+                    style="""
+                        position: fixed;
+                        top: 60px;
+                        left: 0;
+                        width: 100vw;
+                        height: calc(100vh - 60px);
+                        z-index: -1;
+                    """
+                ),
+
+                # 사이드바 토글 버튼
+                ui.tags.button(
+                    "〈",
+                    id="gyeongbuk-toggle-button",
+                    onclick="""
+                        const sidebar = document.getElementById('gyeongbuk-sidebar');
+                        const btn = document.getElementById('gyeongbuk-toggle-button');
+                        const isClosed = sidebar.style.transform === 'translateX(-280px)';
+                        sidebar.style.transform = isClosed ? 'translateX(0)' : 'translateX(-280px)';
+                        sidebar.classList.toggle('open', !isClosed);
+                        btn.innerText = isClosed ? '〈' : '〉';
+                        btn.style.left = isClosed ? '300px' : '20px';
+                    """
+                ),
+
+                # 사이드바
+                ui.div(
+                    ui.h3("경상북도 지역 선택", style="margin-bottom: 20px;"),
+                    ui.input_checkbox_group(
+                        "gyeongbuk_selected_areas", 
+                        "", 
+                        choices={
+                            area: ui.HTML(f"""
+                                <span style="display: inline-flex; align-items: center;">
+                                    {area}
+                                    <span style="
+                                        display: inline-block;
+                                        width: 12px;
+                                        height: 12px;
+                                        background-color: {REGION_COLORS.get(area, '#808080')};
+                                        border-radius: 50%;
+                                        margin-left: 8px;
+                                        border: 1px solid #ddd;
+                                    "></span>
+                                </span>
+                            """) for area in unique_gyeongbuk_areas
+                        },
+                        selected=[]
+                    ),
+                    
+                    ui.div(
+                        ui.tags.button(
+                            "모두선택",
+                            onclick="""
+                                const checkboxes = document.querySelectorAll("input[type='checkbox'][name='gyeongbuk_selected_areas']");
+                                checkboxes.forEach(checkbox => {
+                                    if (!checkbox.checked) {
+                                        checkbox.click();
+                                    }
+                                });
+                            """,
+                            style="width: 44%; padding: 8px; background-color: #2196F3; color: white; border: none; border-radius: 4px; font-size: 12px; font-weight: bold; cursor: pointer; margin-right: 4%;"
+                        ),
+                        ui.tags.button(
+                            "모두해제",
+                            onclick="""
+                                const checkboxes = document.querySelectorAll("input[type='checkbox'][name='gyeongbuk_selected_areas']");
+                                checkboxes.forEach(checkbox => {
+                                    if (checkbox.checked) {
+                                        checkbox.click();
+                                    }
+                                });
+                            """,
+                            style="width: 44%; padding: 8px; background-color: #f44336; color: white; border: none; border-radius: 4px; font-size: 12px; font-weight: bold; cursor: pointer;"
+                        ),
+                        style="margin-top: 10px; margin-bottom: 15px; display: flex;"
+                    ),
+                    
+                    ui.input_action_button("gyeongbuk_apply_selection", "선택 지역 분석하기", 
+                                        style="width: 92%; margin-top: 10px; padding: 10px; background-color: #4caf50; color: white; border: none; border-radius: 5px; font-weight: bold;"),
+                    id="gyeongbuk-sidebar",
+                    class_="open"
+                ),
+
+                # 팝업 창들
+                ui.output_ui("gyeongbuk_popup"),
+                ui.output_ui("gyeongbuk_details")
+            )
+        
+        else:
+        # ── 영천 UI ──
+            return ui.TagList(
+                # 지도
+                ui.output_ui(
+                    "yeongcheon_map",
+                    style="""
+                        position: fixed;
+                        top: 60px;
+                        left: 0;
+                        width: 100vw;
+                        height: calc(100vh - 60px);
+                        z-index: -1;
+                    """
+                ),
+
+                # 사이드바 토글 버튼
+                ui.tags.button(
+                    "〈",
+                    id="yeongcheon-toggle-button",
+                    onclick="""
+                        const sidebar = document.getElementById('yeongcheon-sidebar');
+                        const btn = document.getElementById('yeongcheon-toggle-button');
+                        const isClosed = sidebar.style.transform === 'translateX(-280px)';
+                        sidebar.style.transform = isClosed ? 'translateX(0)' : 'translateX(-280px)';
+                        btn.innerText = isClosed ? '〈' : '〉';
+                        btn.style.left = isClosed ? '300px' : '20px';
+                    """
+                ),
+
+                # 사이드바
+                ui.div(
+                    ui.h3("영천시 저수지 분석", style="margin-bottom: 20px;"),
+                    ui.div(
+                        ui.h4("저수지 필터링"),
+                        ui.input_select("yeongcheon_area", "읍면동 선택", choices=unique_areas, selected="전체"),
+                        ui.input_numeric("yeongcheon_top_n", "상위 저수지 개수", value=10, min=1, max=len(df_yeongcheon) if not df_yeongcheon.empty else 10),
+                        class_="sidebar-section"
+                    ),
+                    ui.div(
+                        ui.h4("가중치 설정"),
+                        ui.input_slider("yeongcheon_weight_area", "면적 가중치", min=0, max=1, value=0.3, step=0.05),
+                        ui.input_slider("yeongcheon_weight_perimeter", "둘레 가중치", min=0, max=1, value=0.3, step=0.05),
+                        ui.input_slider("yeongcheon_weight_distance", "거리 가중치", min=0, max=1, value=0.2, step=0.05),
+                        ui.input_slider("yeongcheon_weight_facilities", "시설수 가중치", min=0, max=1, value=0.2, step=0.05),
+                        ui.input_action_button("yeongcheon_apply_filters", "입력", class_="btn btn-primary"),
+                        class_="sidebar-section"
+                    ),
+                    id="yeongcheon-sidebar"
+                ),
+
+                # 지도 타입 선택
+                ui.div(
+                    ui.input_radio_buttons(
+                        "yeongcheon_map_type", "지도 종류 선택",
+                        choices={"normal": "일반 지도", "satellite": "위성 지도"},
+                        selected="normal", inline=True
+                    ),
+                    style="position: fixed; bottom: 20px; right: 20px; z-index: 9999; background-color: rgba(255,255,255,0.95); padding: 15px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.2); max-width: 300px;"
+                ),
+
+                # 동적 리스트와 차트
+                ui.output_ui("yeongcheon_dynamic_list"),
+                ui.output_ui("yeongcheon_dynamic_chart"),
+
+                # 설명 박스
+                ui.div(
+                    ui.output_ui("yeongcheon_description"),
+                    style="""
+                        position: fixed;
+                        top: 80px;
+                        right: 20px;
+                        z-index: 9999;
+                        background-color: rgba(255,255,255,0.95);
+                        padding: 15px;
+                        border-radius: 8px;
+                        box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+                        max-width: 350px;
+                    """
+                )
         )
 
     # ===== 경상북도 관련 서버 함수들 =====
@@ -1236,6 +1784,7 @@ def server(input, output, session):
     @reactive.event(input.gyeongbuk_apply_selection)
     def update_gyeongbuk_analysis_regions():
         selected_regions_for_analysis.set(input.gyeongbuk_selected_areas() or [])
+        log_memory_usage("경상북도 분석 실행")
     
     @output()
     @render.ui
@@ -1247,10 +1796,13 @@ def server(input, output, session):
     def gyeongbuk_popup():
         sel = selected_regions_for_analysis()
         if not sel:
-            return ui.div(style="display: none;")  # 빈 div 반환
+            return ui.div(style="display: none;")
         
         try:
-            fig = plot_radar_chart(
+            cache_key = f"radar_chart_{hash(tuple(sorted(sel)))}"
+            fig = get_cached_or_compute(
+                cache_key,
+                plot_radar_chart,
                 park_fp=DATA_DIR / "시군별_공원_면적.xlsx",
                 acc_fp=DATA_DIR / "경상북도 시도별 교통사고 건수.xlsx",
                 facility_fp=DATA_DIR / "한국문화정보원_전국 반려동물 동반 가능 문화시설 위치 데이터_20221130.csv",
@@ -1338,7 +1890,7 @@ def server(input, output, session):
             id="gyeongbuk-popup-container",
             style="""
                 position: fixed; 
-                top: 20px; 
+                top: 100px; 
                 right: 20px; 
                 width: 520px; 
                 height: 420px; 
@@ -1362,12 +1914,18 @@ def server(input, output, session):
         # 각 탭별 차트 생성
         try:
             # 대기오염 차트
-            pollution_df = analyze_air_pollution_data(DATA_DIR / "월별_도시별_대기오염도.xlsx")
+            cache_key = f"pollution_{hash(tuple(sorted(sel)))}"
+            pollution_df = get_cached_or_compute(
+                cache_key,
+                analyze_air_pollution_data,
+                DATA_DIR / "월별_도시별_대기오염도.xlsx"
+            )
+            
             if pollution_df is not None and not pollution_df.empty:
                 pollutant_cols = [c for c in pollution_df.columns if c.endswith('_평균')]
                 norm = pollution_df.copy()
                 for col in pollutant_cols:
-                    norm[col] = norm[col] / norm[col].max()
+                    norm[col] = (norm[col] / norm[col].max()).astype(np.float32)
                 norm['total_pollution'] = norm[pollutant_cols].sum(axis=1)
                 norm_sel = norm[norm['시군구'].isin(sel)].sort_values('total_pollution', ascending=False)
                 
@@ -1400,7 +1958,12 @@ def server(input, output, session):
                 pollution_html = "<div>대기오염 데이터를 불러올 수 없습니다.</div>"
 
             # 범죄율 차트
-            crime_df = analyze_crime_rate(DATA_DIR / "경찰청_범죄 발생 지역별 통계.xlsx", DATA_DIR / "경상북도 주민등록.xlsx")
+            crime_df = get_cached_or_compute(
+                f"crime_{hash(tuple(sorted(sel)))}",
+                analyze_crime_rate,
+                DATA_DIR / "경찰청_범죄 발생 지역별 통계.xlsx",
+                DATA_DIR / "경상북도 주민등록.xlsx"
+            )
             crime_sel = crime_df[crime_df['region'].isin(sel)]
             crime_fig = px.bar(crime_sel, x='region', y='범죄율', color='region',
                               color_discrete_map=REGION_COLORS, labels={'범죄율':'1인당 범죄율','region':''})
@@ -1412,7 +1975,11 @@ def server(input, output, session):
             crime_html = crime_fig.to_html(full_html=False, include_plotlyjs='cdn', config={'displayModeBar': False})
 
             # 교통사고 차트  
-            traffic_df = analyze_accident_data(DATA_DIR / "경상북도 시도별 교통사고 건수.xlsx")
+            traffic_df = get_cached_or_compute(
+                f"traffic_{hash(tuple(sorted(sel)))}",
+                analyze_accident_data,
+                DATA_DIR / "경상북도 시도별 교통사고 건수.xlsx"
+            )
             traffic_sel = traffic_df[traffic_df['시군'].isin(sel)]
             traffic_fig = px.bar(traffic_sel, x='시군', y='사고비율', color='시군',
                                 color_discrete_map=REGION_COLORS, labels={'사고비율':'1인당 평균 사고','시군':''})
@@ -1424,7 +1991,11 @@ def server(input, output, session):
             traffic_html = traffic_fig.to_html(full_html=False, include_plotlyjs='cdn', config={'displayModeBar': False})
 
             # 공원면적 차트
-            park_df = analyze_park_area(DATA_DIR / "시군별_공원_면적.xlsx")
+            park_df = get_cached_or_compute(
+                f"park_{hash(tuple(sorted(sel)))}",
+                analyze_park_area,
+                DATA_DIR / "시군별_공원_면적.xlsx"
+            )
             park_sel = park_df[park_df['시군'].isin(sel)]
             park_fig = px.bar(park_sel, x='시군', y='공원면적비율', color='시군',
                              color_discrete_map=REGION_COLORS, labels={'공원면적비율':'1인당 공원면적','시군':''})
@@ -1436,7 +2007,12 @@ def server(input, output, session):
             park_html = park_fig.to_html(full_html=False, include_plotlyjs='cdn', config={'displayModeBar': False})
 
             # 반려동물 시설 차트
-            facility_df = analyze_population_facility_ratio(DATA_DIR / "한국문화정보원_전국 반려동물 동반 가능 문화시설 위치 데이터_20221130.csv", DATA_DIR / "경상북도 주민등록.xlsx")
+            facility_df = get_cached_or_compute(
+                f"facility_{hash(tuple(sorted(sel)))}",
+                analyze_population_facility_ratio,
+                DATA_DIR / "한국문화정보원_전국 반려동물 동반 가능 문화시설 위치 데이터_20221130.csv",
+                DATA_DIR / "경상북도 주민등록.xlsx"
+            )
             facility_sel = facility_df[facility_df['region'].isin(sel)]
             facility_fig = px.bar(facility_sel, x='region', y='per_person', color='region',
                                  color_discrete_map=REGION_COLORS, labels={'per_person':'1인당 시설 수','region':''})
@@ -1480,7 +2056,7 @@ def server(input, output, session):
                 style="transform: scale(0.85); transform-origin: top left; width: 118%; height: 118%;"
             ),
             id="gyeongbuk-details-container",
-            style="position: fixed; top: 460px; right: 20px; width: 520px; height: 420px; overflow: hidden; background-color: white; padding: 20px; box-shadow: 0 2px 12px rgba(0,0,0,0.3); z-index: 9998; border-radius: 12px; display: none;"
+            style="position: fixed; top: 540px; right: 20px; width: 520px; height: 420px; overflow: hidden; background-color: white; padding: 20px; box-shadow: 0 2px 12px rgba(0,0,0,0.3); z-index: 9998; border-radius: 12px; display: none;"
         )
 
     # ===== 영천시 관련 서버 함수들 =====
@@ -1495,6 +2071,8 @@ def server(input, output, session):
     def handle_yeongcheon_apply():
         if df_yeongcheon.empty:
             return
+        
+        log_memory_usage("영천시 필터 적용")
         
         # 먼저 저수지 선택 완전히 초기화
         yeongcheon_selected_marker.set(None)
@@ -1525,14 +2103,20 @@ def server(input, output, session):
             w_perimeter * filtered['둘레_정규화'] +
             w_distance * filtered['거리_정규화'] +
             w_facilities * filtered['시설수_정규화']
-        )
+        ).astype(np.float32)
         
         top_data = filtered.nlargest(max(1, input.yeongcheon_top_n()), '적합도점수').reset_index(drop=True)
+        top_data = optimize_dataframe_memory(top_data)
         
         yeongcheon_current_data.set(top_data)
         yeongcheon_show_list.set(True)
         yeongcheon_show_chart.set(True)
         yeongcheon_button_clicks.set({})
+        
+        # 메모리 정리
+        del filtered
+        gc.collect()
+        
         print(f"분석 실행됨 - 저수지 선택 초기화됨")
 
     # 엔터키 눌림 처리 추가 (영천시)
@@ -1542,6 +2126,8 @@ def server(input, output, session):
         print("영천시 엔터키 감지됨 - 입력 버튼과 동일한 동작 실행")
         if df_yeongcheon.empty:
             return
+        
+        log_memory_usage("영천시 엔터키 입력")
         
         # 먼저 저수지 선택 완전히 초기화
         yeongcheon_selected_marker.set(None)
@@ -1572,14 +2158,20 @@ def server(input, output, session):
             w_perimeter * filtered['둘레_정규화'] +
             w_distance * filtered['거리_정규화'] +
             w_facilities * filtered['시설수_정규화']
-        )
+        ).astype(np.float32)
         
         top_data = filtered.nlargest(max(1, input.yeongcheon_top_n()), '적합도점수').reset_index(drop=True)
+        top_data = optimize_dataframe_memory(top_data)
         
         yeongcheon_current_data.set(top_data)
         yeongcheon_show_list.set(True)
         yeongcheon_show_chart.set(True)
         yeongcheon_button_clicks.set({})
+        
+        # 메모리 정리
+        del filtered
+        gc.collect()
+        
         print(f"엔터키로 영천시 입력 실행됨 - 데이터 길이: {len(top_data)}, 저수지 선택 초기화됨")
 
     @output
@@ -1693,8 +2285,23 @@ def server(input, output, session):
             ui.p(f"적합도 점수: {round(row['적합도점수'], 3)}")
         )
 
+    # 세션 종료 시 메모리 정리
+    @reactive.Effect
+    def cleanup_on_session_end():
+        def cleanup():
+            global _cached_data
+            _cached_data.clear()
+            gc.collect()
+            log_memory_usage("세션 종료")
+        
+        session.on_ended(cleanup)
+
+# 앱 생성 시 메모리 로깅
+log_memory_usage("앱 초기화 시작")
 
 here = os.path.dirname(__file__)
 static_path = str(WWW_DIR)
 
 app = App(app_ui, server, static_assets=static_path)
+
+log_memory_usage("앱 초기화 완료")
