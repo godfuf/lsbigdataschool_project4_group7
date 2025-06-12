@@ -5,7 +5,7 @@
         "app_url": "https://godfuf.shinyapps.io/yeongcheon-pet/",
         "app_id": 14808068,
         "app_guid": null,
-        "title": "yeongcheon-pet",
+        "title": "yeongcheon_pet",
         "app_mode": "python-shiny",
         "app_store_version": 1
     }
