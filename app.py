@@ -547,42 +547,54 @@ except Exception as e:
 
 # ====== 영천시 지도 생성 함수 (수정된 버전) ======
 def create_yeongcheon_map(selected_marker=None, map_type="normal", locations=None, selected_area=None):
-    """영천시 지도 생성 (수정된 버전)"""
     if df_yeongcheon.empty:
         return "<div>지도 데이터를 불러올 수 없습니다.</div>"
-    
-    # 기본 중심점과 줌 레벨
+
+    # 기본 중심(영천시 중심)과 줌
     center_lat, center_lng = 35.961380, 128.927778
     zoom = 11
 
-    if locations is None:
-        locations = pd.DataFrame()
-
-    # 1. 읍면동 선택에 따른 지도 중심/줌 결정 (우선순위 높음)
+    # 1) 읍면동 선택해서 중심 이동
+    # 1) 읍면동 선택에 따른 지도 중심/줌 결정 (우선순위 높음)
     if selected_area and selected_area != "전체" and not gdf_yeongcheon.empty:
-        # 표준화된 컬럼명 사용
         area_gdf = gdf_yeongcheon[gdf_yeongcheon['ADM_NM'] == selected_area]
         if not area_gdf.empty:
             bounds = area_gdf.total_bounds
+            # 원래 중심
             center_lat = (bounds[1] + bounds[3]) / 2
             center_lng = (bounds[0] + bounds[2]) / 2
             zoom = 13
-            
-    # 2. 저수지가 선택되었고 locations에 해당 저수지가 있을 때만 위치 변경
-    elif selected_marker and not locations.empty and selected_marker in locations['시설명'].values:
-        selected = locations[locations['시설명'] == selected_marker]
-        if not selected.empty:
-            center_lat, center_lng = selected.iloc[0]['위도'], selected.iloc[0]['경도']
+            # 우측 팝업(정보창) 영역을 피해서 왼쪽으로 오프셋
+            offset = 0.02   # 줌 레벨에 따라 0.005 ~ 0.02 사이로 조절
+            center_lng = center_lng - offset
+    # 2) 마커 클릭 없이, 입력만 눌러 locations(=top_data)가 생성된 경우
+    elif (selected_marker is None) and (locations is not None) and (not locations.empty):
+        # top_data 첫 번째 행 = 1위 저수지
+        lat = locations.iloc[0]['위도']
+        lng = locations.iloc[0]['경도']
+        offset = 0.01   # 줌 레벨에 맞춰 0.005~0.02 사이 값으로 조절
+        center_lat = lat
+        center_lng = lng - offset
+        zoom = 15
+
+    # 3) 사용자가 직접 저수지 버튼 클릭했을 때
+    elif selected_marker and (locations is not None) and (selected_marker in locations['시설명'].values):
+        sel = locations[locations['시설명'] == selected_marker]
+        if not sel.empty:
+            lat = sel.iloc[0]['위도']
+            lng = sel.iloc[0]['경도']
+            offset = 0.01
+            center_lat = lat
+            center_lng = lng - offset
             zoom = 15
 
+    # folium 맵 생성
     m = folium.Map(
-        location=[center_lat, center_lng], 
-        zoom_start=zoom, 
-        width="100%", 
-        height="100%",
-        max_zoom=18,
-        zoom_control=False,
-        prefer_canvas=True  # 캔버스 렌더링으로 메모리 절약
+        location=[center_lat, center_lng],
+        zoom_start=zoom,
+        width="100%", height="100%",
+        max_zoom=18, zoom_control=False,
+        prefer_canvas=True
     )
     
     if map_type == "satellite":
@@ -2380,7 +2392,7 @@ def server(input, output, session):
                     style="""
                         margin-left: 10px;
                         padding: 4px 8px;
-                        width: 70px;
+                        width: 90px;
                         background-color: #1e3a8a;
                         color: white;
                         border: none;
@@ -2578,113 +2590,126 @@ def server(input, output, session):
     yeongcheon_current_data = reactive.Value(pd.DataFrame())
     yeongcheon_button_clicks = reactive.Value({})
 
+
     @reactive.Effect
     @reactive.event(input.yeongcheon_apply_filters)  
     def handle_yeongcheon_apply():
         if df_yeongcheon.empty:
             return
-        
+
         log_memory_usage("영천시 필터 적용")
         
-        # 먼저 저수지 선택 완전히 초기화
+        # 1) 초기화
         yeongcheon_selected_marker.set(None)
         
+        # 2) 영역 필터링
         if input.yeongcheon_area() == "전체":
             filtered = df_yeongcheon.copy()
         else:
             filtered = df_yeongcheon[df_yeongcheon['행정동명'] == input.yeongcheon_area()].copy()
         
-        # 가중치 적용
-        w_area = input.yeongcheon_weight_area()
-        w_perimeter = input.yeongcheon_weight_perimeter()
-        w_distance = input.yeongcheon_weight_distance()
+        # 3) 가중치 계산
+        w_area       = input.yeongcheon_weight_area()
+        w_perimeter  = input.yeongcheon_weight_perimeter()
+        w_distance   = input.yeongcheon_weight_distance()
         w_facilities = input.yeongcheon_weight_facilities()
-        
         total = w_area + w_perimeter + w_distance + w_facilities
         if total == 0:
             w_area, w_perimeter, w_distance, w_facilities = 0.3, 0.3, 0.2, 0.2
-            total = 1
         else:
-            w_area /= total
-            w_perimeter /= total
-            w_distance /= total
+            w_area       /= total
+            w_perimeter  /= total
+            w_distance   /= total
             w_facilities /= total
 
+        # 4) 적합도점수 계산
         filtered['적합도점수'] = (
-            w_area * filtered['면적_정규화'] +
-            w_perimeter * filtered['둘레_정규화'] +
-            w_distance * filtered['거리_정규화'] +
+            w_area       * filtered['면적_정규화'] +
+            w_perimeter  * filtered['둘레_정규화'] +
+            w_distance   * filtered['거리_정규화'] +
             w_facilities * filtered['시설수_정규화']
         ).astype(np.float32)
-        
-        top_data = filtered.nlargest(max(1, input.yeongcheon_top_n()), '적합도점수').reset_index(drop=True)
+
+        # 5) 상위 N개 추출
+        top_data = filtered.nlargest(
+            max(1, input.yeongcheon_top_n()), '적합도점수'
+        ).reset_index(drop=True)
         top_data = optimize_dataframe_memory(top_data)
         
+        # ─── 추가된 부분: 1위 저수지 자동 선택 ───
+        yeongcheon_selected_marker.set(top_data.iloc[0]['시설명'])
+
         yeongcheon_current_data.set(top_data)
         yeongcheon_show_list.set(True)
         yeongcheon_show_chart.set(True)
         yeongcheon_button_clicks.set({})
-        
+
         # 메모리 정리
         del filtered
         gc.collect()
-        
-        print(f"분석 실행됨 - 저수지 선택 초기화됨")
 
-    # 엔터키 눌림 처리 추가 (영천시)
+        print(f"분석 실행됨 - 1위({top_data.iloc[0]['시설명']}) 자동 선택됨")
+
+
     @reactive.Effect
     @reactive.event(input.yeongcheon_enter_key_pressed)
     def handle_yeongcheon_enter_key():
-        print("영천시 엔터키 감지됨 - 입력 버튼과 동일한 동작 실행")
         if df_yeongcheon.empty:
             return
-        
+
         log_memory_usage("영천시 엔터키 입력")
         
-        # 먼저 저수지 선택 완전히 초기화
+        # 1) 초기화
         yeongcheon_selected_marker.set(None)
-            
+        
+        # 2) 영역 필터링
         if input.yeongcheon_area() == "전체":
             filtered = df_yeongcheon.copy()
         else:
             filtered = df_yeongcheon[df_yeongcheon['행정동명'] == input.yeongcheon_area()].copy()
         
-        # 가중치 적용
-        w_area = input.yeongcheon_weight_area()
-        w_perimeter = input.yeongcheon_weight_perimeter()
-        w_distance = input.yeongcheon_weight_distance()
+        # 3) 가중치 계산 (위와 동일)
+        w_area       = input.yeongcheon_weight_area()
+        w_perimeter  = input.yeongcheon_weight_perimeter()
+        w_distance   = input.yeongcheon_weight_distance()
         w_facilities = input.yeongcheon_weight_facilities()
-        
         total = w_area + w_perimeter + w_distance + w_facilities
         if total == 0:
             w_area, w_perimeter, w_distance, w_facilities = 0.3, 0.3, 0.2, 0.2
-            total = 1
         else:
-            w_area /= total
-            w_perimeter /= total
-            w_distance /= total
+            w_area       /= total
+            w_perimeter  /= total
+            w_distance   /= total
             w_facilities /= total
 
+        # 4) 적합도점수 계산
         filtered['적합도점수'] = (
-            w_area * filtered['면적_정규화'] +
-            w_perimeter * filtered['둘레_정규화'] +
-            w_distance * filtered['거리_정규화'] +
+            w_area       * filtered['면적_정규화'] +
+            w_perimeter  * filtered['둘레_정규화'] +
+            w_distance   * filtered['거리_정규화'] +
             w_facilities * filtered['시설수_정규화']
         ).astype(np.float32)
-        
-        top_data = filtered.nlargest(max(1, input.yeongcheon_top_n()), '적합도점수').reset_index(drop=True)
+
+        # 5) 상위 N개 추출
+        top_data = filtered.nlargest(
+            max(1, input.yeongcheon_top_n()), '적합도점수'
+        ).reset_index(drop=True)
         top_data = optimize_dataframe_memory(top_data)
         
+        # ─── 추가된 부분: 1위 저수지 자동 선택 ───
+        yeongcheon_selected_marker.set(top_data.iloc[0]['시설명'])
+
         yeongcheon_current_data.set(top_data)
         yeongcheon_show_list.set(True)
         yeongcheon_show_chart.set(True)
         yeongcheon_button_clicks.set({})
-        
+
         # 메모리 정리
         del filtered
         gc.collect()
-        
-        print(f"엔터키로 영천시 입력 실행됨 - 데이터 길이: {len(top_data)}, 저수지 선택 초기화됨")
+
+        print(f"엔터키 실행됨 - 1위({top_data.iloc[0]['시설명']}) 자동 선택됨")
+
 
     @output
     @render.ui
